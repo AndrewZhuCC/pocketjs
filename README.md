@@ -208,6 +208,7 @@ a hardware protocol receipt, and a manual screen check prove different things.
 | **macOS widget** | Registered Guest profile | Dynamic native window, pointer, keyboard/IME, clipboard, and runtime glyph paths |
 | **Browser, desktop, headless Bun** | Guest development and verification hosts | WASM/native rendering, interactive development, deterministic simulation, and image goldens |
 | **Nokia E7 / Symbian** | Hardware-tested development Guest host | SIS install, launch, visible rendering, keys, and rotation on the reference device; not a production target profile |
+| **Nintendo 3DS** | Emulator-tested development Guest host | QuickJS guest and PICA200 (citro3d) rendering on the 400×240 top screen, driven by Azahar with byte-exact goldens taken from a GX readback of the render target; no hardware pass yet, so it is not a production target profile |
 | **GBA, Game Boy, NES** | Pocket Vapor AOT | Per-interaction emulator parity against the Vue oracle, including logical characters and styles |
 | **ESP32 MeowBit** | Pocket Vapor AOT | Optional physical-board UART replay verifies the logical grid and exercises LCD commits; it neither reads panel pixels nor actuates GPIO buttons |
 | **Playdate** | Pocket Vapor AOT | Native-boundary tests and Simulator/device package smoke; physical display and input acceptance remains manual |

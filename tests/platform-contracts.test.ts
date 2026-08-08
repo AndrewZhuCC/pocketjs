@@ -334,6 +334,7 @@ describe("semantic resolution", () => {
     // both policies, while the note is dynamic-only. A new demo missing here
     // fails the test on purpose.
     const expected: Record<string, [boolean, boolean, boolean]> = {
+      "3ds-demo": [false, false, false], // admitted only by the private 3ds-dev profile (400x240 native)
       cafe: [true, true, false],
       cards: [true, true, false],
       chrome: [true, true, false],
