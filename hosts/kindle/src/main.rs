@@ -47,8 +47,12 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self> {
         let mut args = Self {
-            js: env_path("POCKET_JS").unwrap_or_else(|| "app.js".into()),
-            pak: env_path("POCKET_PAK").unwrap_or_else(|| "app.pak".into()),
+            // Prefer the content-addressed deploy layout so bare launches from KUAL
+            // (no --js/--pak) still find the guest after a normal deploy.
+            js: env_path("POCKET_JS")
+                .unwrap_or_else(|| "/mnt/us/pocketjs-dev/current/app.js".into()),
+            pak: env_path("POCKET_PAK")
+                .unwrap_or_else(|| "/mnt/us/pocketjs-dev/current/app.pak".into()),
             framebuffer: env_path("POCKETJS_FRAMEBUFFER").unwrap_or_else(|| "/dev/fb0".into()),
             fbink: env_path("POCKETJS_FBINK")
                 .unwrap_or_else(|| "/mnt/us/pocketjs-dev/bin/fbink".into()),
@@ -133,8 +137,13 @@ fn print_help() {
 PocketJS Kindle host
 
 Usage:
-  pocketjs-kindle --js app.js --pak app.pak [options]
+  pocketjs-kindle [options]
   pocketjs-kindle --probe [options]
+
+Defaults (overridable by flags or env):
+  --js   /mnt/us/pocketjs-dev/current/app.js   (POCKET_JS)
+  --pak  /mnt/us/pocketjs-dev/current/app.pak  (POCKET_PAK)
+  --fbink /mnt/us/pocketjs-dev/bin/fbink       (POCKETJS_FBINK)
 
 Options:
   --framebuffer PATH       Linux framebuffer (default /dev/fb0)
@@ -146,10 +155,35 @@ Options:
   --allow-active-gui       explicit unsafe override of the GUI-pause guard
 
 SIGHUP reloads JS/pak at the next 60Hz frame boundary. SIGINT/SIGTERM exit.
+While running, hold the bottom-left corner (~40x40 logical px) for ~1.5s to
+exit cleanly — the Kindle UI is paused so KUAL Stop Runtime is unreachable.
+
 The matching environment variables are POCKET_JS, POCKET_PAK,
 POCKETJS_FRAMEBUFFER, POCKETJS_FBINK, POCKETJS_PRESENT_HZ,
 POCKETJS_MOTION_WAVEFORM, POCKETJS_GHOST_BUDGET, and POCKETJS_ROTATION."
     );
+}
+
+/// Logical-space corner used as an always-on exit affordance. Runtime pauses
+/// the Kindle UI, so Stop Runtime in KUAL is not reachable without this.
+const EXIT_CORNER_W: u32 = 40;
+const EXIT_CORNER_H: u32 = 40;
+const EXIT_HOLD: Duration = Duration::from_millis(1500);
+
+fn touch_xy(packed: u32) -> (u32, u32) {
+    let x = packed & 0x1ff;
+    let y = (packed >> 9) & 0x1ff;
+    (x, y)
+}
+
+fn in_exit_corner(packed: u32) -> bool {
+    let (x, y) = touch_xy(packed);
+    x < EXIT_CORNER_W && y + EXIT_CORNER_H >= LOGICAL_H as u32
+}
+
+/// True when a single contact is held inside the exit corner.
+fn exit_hold_active(touches: &[u32]) -> bool {
+    touches.len() == 1 && in_exit_corner(touches[0])
 }
 
 struct AppRuntime {
@@ -337,6 +371,7 @@ fn main() -> Result<()> {
     let mut pending = Vec::<Rect>::new();
     let mut first_frame = true;
     let mut force_refresh = false;
+    let mut exit_hold_since: Option<Instant> = None;
 
     while !terminate.load(Ordering::Relaxed) {
         if reload.swap(false, Ordering::AcqRel) {
@@ -359,6 +394,19 @@ fn main() -> Result<()> {
         let mut catchup = 0;
         while Instant::now() >= next_tick && catchup < MAX_CATCHUP_TICKS {
             let touches = input.poll_touches(&geometry)?;
+            if exit_hold_active(&touches) {
+                let since = exit_hold_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= EXIT_HOLD {
+                    log::info!(
+                        "kindle exit hold: bottom-left corner held {:?}; requesting clean exit",
+                        EXIT_HOLD
+                    );
+                    terminate.store(true, Ordering::Relaxed);
+                    break;
+                }
+            } else {
+                exit_hold_since = None;
+            }
             // Diff against the last frame actually copied to /dev/fb0, not
             // against the preceding 60Hz simulation frame. This bounds damage
             // while FBInk is busy and lets A -> B -> A disappear before a

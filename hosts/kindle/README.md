@@ -73,10 +73,18 @@ pocketjs-kindle \
   --fbink /mnt/us/pocketjs-dev/bin/fbink
 ```
 
+Those three paths are also the **defaults** when no flags/env are set, so a
+bare `pocketjs-kindle` (or KUAL **Run Runtime**) works after a normal deploy.
+
 The same paths can be set with `POCKET_JS`, `POCKET_PAK`, and
 `POCKETJS_FBINK`. `SIGHUP` builds a new `Guest` and `UiSurface` at the next
 60 Hz frame boundary; a bad or half-deployed bundle is rejected and the old
 guest keeps running. `SIGINT` and `SIGTERM` exit cleanly.
+
+While the runtime owns the screen it pauses the Kindle UI, so KUAL
+**Stop Runtime** is unreachable. Hold the **bottom-left corner** of the panel
+(~40×40 logical pixels) for about **1.5 seconds** to request a clean exit;
+the launcher then resumes the UI.
 
 The logical simulation always ticks at 60 Hz. Physical presentation is
 independently capped by `--present-hz` (30 by default). Rendering is fused to

@@ -1115,6 +1115,15 @@ export function stageKindleVolume(
       "managed-text",
       "PocketJS KUAL menu",
     ),
+    // KUALBooklet discovers extensions via config.xml; menu.json alone is ignored.
+    planFile(
+      volume,
+      join(volume, "extensions", "PocketJS", "config.xml"),
+      readTemplate(repositoryRoot, "config.xml", sshPort),
+      0o644,
+      "managed-text",
+      "PocketJS KUAL extension descriptor",
+    ),
     planFile(
       volume,
       join(volume, "extensions", "PocketJS", "bin", "pocketjs.sh"),
@@ -1123,13 +1132,20 @@ export function stageKindleVolume(
       "managed-text",
       "PocketJS KUAL dispatcher",
     ),
+    // Prefer a preinstalled USBNetwork/NiLuJe fbink on the volume when present.
+    // The KOReader kindlehf build needs ld-linux-armhf.so.3 which some 5.16.x
+    // firmwares do not ship; the USBNetwork binary is the one that already runs.
     planFile(
       volume,
       join(devRoot, "bin", "fbink"),
-      payload.fbink,
+      existsSync(join(volume, "usbnet", "bin", "fbink"))
+        ? readFileSync(join(volume, "usbnet", "bin", "fbink"))
+        : payload.fbink,
       0o755,
       "identical-only",
-      "kindlehf fbink",
+      existsSync(join(volume, "usbnet", "bin", "fbink"))
+        ? "usbnet fbink (preferred for firmwares without ld-linux-armhf)"
+        : "kindlehf fbink",
     ),
     planFile(
       volume,
