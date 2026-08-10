@@ -1,0 +1,18 @@
+{
+  "$schema": "https://pocketjs.dev/schema/pocket-2.json",
+  "pocket": 2,
+  "id": "app.anzhi.manga",
+  "name": "pocketjs-manga",
+  "title": "漫画 (Suwayomi)",
+  "version": "0.1.0",
+  "engine": {
+    "capabilities": {
+      "requires": ["input.touch", "text.glyphs.baked"]
+    }
+  },
+  "app": {
+    "entry": "apps/manga/main.tsx",
+    "output": "manga-main",
+    "framework": "solid"
+  }
+}

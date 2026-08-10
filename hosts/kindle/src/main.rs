@@ -5,6 +5,7 @@ mod framebuffer;
 mod geometry;
 mod input;
 mod refresh;
+mod remote_image;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,8 @@ struct Args {
     ghost_budget: u32,
     rotation: Option<Rotation>,
     probe: bool,
+    /// Load a still image (path or http(s) URL), blit full-screen, wait for exit.
+    show_image: Option<String>,
     allow_active_gui: bool,
 }
 
@@ -65,6 +68,7 @@ impl Args {
                 &std::env::var("POCKETJS_ROTATION").unwrap_or_else(|_| "auto".into()),
             )?,
             probe: false,
+            show_image: None,
             allow_active_gui: false,
         };
 
@@ -99,6 +103,7 @@ impl Args {
                 }
                 "--rotation" => args.rotation = Rotation::parse(value(&mut index)?)?,
                 "--probe" => args.probe = true,
+                "--show-image" => args.show_image = Some(value(&mut index)?.to_string()),
                 "--allow-active-gui" => args.allow_active_gui = true,
                 "-h" | "--help" => {
                     print_help();
@@ -153,10 +158,12 @@ Options:
   --ghost-budget N         fast updates before a full GC16 cleanup
   --rotation auto|0|90|180|270
   --allow-active-gui       explicit unsafe override of the GUI-pause guard
+  --show-image PATH|URL    fetch/decode a still image, full-screen blit, wait
 
 SIGHUP reloads JS/pak at the next 60Hz frame boundary. SIGINT/SIGTERM exit.
 While running, hold the bottom-left corner (~40x40 logical px) for ~1.5s to
 exit cleanly — the Kindle UI is paused so KUAL Stop Runtime is unreachable.
+Manga apps should also expose a real on-screen Exit control.
 
 The matching environment variables are POCKET_JS, POCKET_PAK,
 POCKETJS_FRAMEBUFFER, POCKETJS_FBINK, POCKETJS_PRESENT_HZ,
@@ -184,6 +191,96 @@ fn in_exit_corner(packed: u32) -> bool {
 /// True when a single contact is held inside the exit corner.
 fn exit_hold_active(touches: &[u32]) -> bool {
     touches.len() == 1 && in_exit_corner(touches[0])
+}
+
+/// Phase-A manga probe: load one still (file or URL), blit Gray8 full-screen,
+/// GC16 refresh, then wait for corner-hold exit (or any long press in corner).
+fn run_show_image(
+    source: &str,
+    args: &Args,
+    geometry: &Geometry,
+    mut framebuffer: Framebuffer,
+    mut input: Input,
+) -> Result<()> {
+    let gui_paused = std::env::var("POCKETJS_GUI_PAUSED")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if !gui_paused && !args.allow_active_gui {
+        bail!(
+            "refusing --show-image while the Kindle GUI may be active; \
+             launch via run-runtime.sh or pass --allow-active-gui"
+        );
+    }
+
+    input
+        .grab_selected()
+        .context("claiming the Kindle touchscreen")?;
+
+    let page = remote_image::load_page(source, geometry.render_w, geometry.render_h)
+        .with_context(|| format!("loading image {source}"))?;
+    if page.width != geometry.render_w || page.height != geometry.render_h {
+        bail!(
+            "page buffer {}x{} does not match render {}x{}",
+            page.width,
+            page.height,
+            geometry.render_w,
+            geometry.render_h
+        );
+    }
+
+    let full = Rect {
+        x: 0,
+        y: 0,
+        w: geometry.render_w,
+        h: geometry.render_h,
+    };
+    framebuffer
+        .write_rects(&page.pixels, geometry.render_w, &[full], geometry)
+        .context("blitting decoded page to framebuffer")?;
+
+    let mut fbink = FbInk::new(&args.fbink)?;
+    fbink.submit(refresh::RefreshRequest {
+        rect: geometry.render_rect_to_panel(full),
+        waveform: Waveform::Gc16,
+        flash: true,
+        kind: refresh::RefreshKind::Forced,
+    })?;
+    fbink.finish().context("waiting for initial GC16")?;
+
+    log::info!(
+        "show-image ready: source={source}, render={}x{}, tap bottom-left ~1.5s to exit",
+        geometry.render_w,
+        geometry.render_h
+    );
+
+    let terminate = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, terminate.clone()).context("registering SIGINT")?;
+    signal_hook::flag::register(SIGTERM, terminate.clone()).context("registering SIGTERM")?;
+
+    let mut exit_hold_since: Option<Instant> = None;
+    let mut next_tick = Instant::now();
+    while !terminate.load(Ordering::Relaxed) {
+        while Instant::now() >= next_tick {
+            let touches = input.poll_touches(geometry)?;
+            if exit_hold_active(&touches) {
+                let since = exit_hold_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= EXIT_HOLD {
+                    log::info!("show-image: exit hold satisfied");
+                    terminate.store(true, Ordering::Relaxed);
+                    break;
+                }
+            } else {
+                exit_hold_since = None;
+            }
+            next_tick += LOGIC_TICK;
+        }
+        let now = Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        }
+    }
+
+    log::info!("show-image exiting cleanly");
+    Ok(())
 }
 
 struct AppRuntime {
@@ -317,6 +414,10 @@ fn main() -> Result<()> {
             input.device_count()
         );
         return Ok(());
+    }
+
+    if let Some(source) = args.show_image.as_deref() {
+        return run_show_image(source, &args, &geometry, framebuffer, input);
     }
 
     let gui_paused = std::env::var("POCKETJS_GUI_PAUSED")

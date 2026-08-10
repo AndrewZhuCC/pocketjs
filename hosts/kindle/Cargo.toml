@@ -17,10 +17,13 @@ pocket-ui-surface = { path = "../../engine/crates/pocket-ui-surface" }
 
 anyhow = "1"
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 libc = "0.2"
 log = "0.4"
 memmap2 = "0.9"
 signal-hook = "0.3"
+# TLS via rustls — required for armv7-musl cross builds (no system openssl).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 # rquickjs does not publish pre-generated bindings for this ARM musl triplet.
 # Cargo feature unification enables bindgen for pocket-mod's rquickjs-sys only

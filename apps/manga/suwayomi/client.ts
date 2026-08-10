@@ -1,0 +1,287 @@
+/**
+ * Suwayomi GraphQL client (P0).
+ * Ported/trimmed from venera-sources/sorayomi.js — library path first;
+ * source browse queries are stubbed until host net+image lands.
+ */
+
+export type SuwayomiConfig = {
+  baseUrl: string;
+  /** raw Cookie header value, if any */
+  cookie?: string;
+};
+
+export type MangaListItem = {
+  id: number;
+  title: string;
+  thumbnailUrl: string;
+  sourceId?: string;
+  sourceName?: string;
+  unreadCount?: number;
+  inLibrary?: boolean;
+};
+
+export type ChapterItem = {
+  id: number;
+  name: string;
+  sourceOrder: number;
+  chapterNumber?: number;
+  isRead: boolean;
+  lastPageRead: number;
+  pageCount: number;
+};
+
+export type SourceItem = {
+  id: string;
+  name: string;
+  lang: string;
+  isNsfw?: boolean;
+};
+
+const VALIDATE = `query VALIDATE_LOGIN { categories(first: 1) { totalCount } }`;
+
+const CATEGORIES = `
+query GET_CATEGORIES($first: Int!, $offset: Int!) {
+  categories(first: $first, offset: $offset, order: [{ by: ORDER, byType: ASC }]) {
+    nodes { id name default order mangas { totalCount } }
+    totalCount
+  }
+}`;
+
+const CATEGORY_MANGAS = `
+query GET_CATEGORY_MANGAS($first: Int!, $offset: Int!, $categoryIds: [Int!]) {
+  mangas(
+    condition: { inLibrary: true, categoryIds: $categoryIds }
+    first: $first
+    offset: $offset
+    order: [{ by: TITLE, byType: ASC }]
+  ) {
+    nodes {
+      id title thumbnailUrl inLibrary sourceId unreadCount
+      source { id displayName }
+    }
+    totalCount
+  }
+}`;
+
+const MANGA_INFO = `
+query GET_MANGA_INFO($id: Int!, $chapterFirst: Int!, $chapterOffset: Int!) {
+  manga(id: $id) {
+    id title thumbnailUrl author artist description genre status realUrl sourceId
+    source { id displayName }
+    firstUnreadChapter { id sourceOrder }
+  }
+  chapters(
+    condition: { mangaId: $id }
+    first: $chapterFirst
+    offset: $chapterOffset
+    order: [{ by: SOURCE_ORDER, byType: DESC }]
+  ) {
+    nodes {
+      id name mangaId sourceOrder chapterNumber isRead lastPageRead pageCount
+      scanlator isDownloaded
+    }
+    totalCount
+  }
+}`;
+
+const FETCH_CHAPTERS = `
+mutation GET_MANGA_CHAPTERS_FETCH($input: FetchChaptersInput!) {
+  fetchChapters(input: $input) {
+    chapters {
+      id name mangaId sourceOrder chapterNumber isRead lastPageRead pageCount
+    }
+  }
+}`;
+
+const FETCH_PAGES = `
+mutation GET_CHAPTER_PAGES_FETCH($input: FetchChapterPagesInput!) {
+  fetchChapterPages(input: $input) {
+    chapter { id pageCount }
+    pages
+  }
+}`;
+
+const UPDATE_CHAPTER = `
+mutation UPDATE_CHAPTER_PROGRESS($input: UpdateChapterInput!) {
+  updateChapter(input: $input) {
+    chapter { id isRead lastPageRead }
+  }
+}`;
+
+/** Installed sources only — no extension install/remove in P0. */
+const SOURCES = `
+query GET_SOURCES($isNsfw: Boolean) {
+  sources(isNsfw: $isNsfw) {
+    nodes {
+      id
+      name
+      lang
+      isNsfw
+      supportsLatest
+    }
+    totalCount
+  }
+}`;
+
+function absUrl(base: string, url: string): string {
+  if (!url) return "";
+  if (/^https?:\/\//i.test(url)) return url;
+  const b = base.replace(/\/$/, "");
+  return `${b}${url.startsWith("/") ? url : `/${url}`}`;
+}
+
+export type HttpPost = (
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+) => Promise<{ status: number; body: string; setCookie?: string[] }>;
+
+/**
+ * Minimal client. `httpPost` must be provided by the host bridge once net
+ * lands; until then unit tests / desktop can inject a stub.
+ */
+export class SuwayomiClient {
+  constructor(
+    private config: SuwayomiConfig,
+    private httpPost: HttpPost,
+  ) {}
+
+  get baseUrl() {
+    return this.config.baseUrl.replace(/\/$/, "");
+  }
+
+  get graphQlUrl() {
+    return `${this.baseUrl}/api/graphql`;
+  }
+
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = {
+      "Content-Type": "application/json; charset=utf-8",
+    };
+    if (this.config.cookie) {
+      h.Cookie = this.config.cookie;
+    }
+    return h;
+  }
+
+  async graphql<T = unknown>(
+    query: string,
+    variables?: Record<string, unknown>,
+  ): Promise<T> {
+    const res = await this.httpPost(
+      this.graphQlUrl,
+      this.headers(),
+      JSON.stringify({ query, variables: variables ?? {} }),
+    );
+    if (res.status === 401) {
+      throw new Error("Unauthorized");
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const json = JSON.parse(res.body) as {
+      data?: T;
+      errors?: { message?: string }[];
+    };
+    if (json.errors?.length) {
+      throw new Error(json.errors[0]?.message || "GraphQL error");
+    }
+    if (!json.data) throw new Error("Empty GraphQL data");
+    return json.data;
+  }
+
+  async validateLogin(): Promise<boolean> {
+    try {
+      const data = await this.graphql<{ categories: unknown }>(VALIDATE);
+      return !!data.categories;
+    } catch {
+      return false;
+    }
+  }
+
+  async listCategories() {
+    const data = await this.graphql<{
+      categories: {
+        nodes: { id: number; name: string; order: number; mangas?: { totalCount: number } }[];
+      };
+    }>(CATEGORIES, { first: 200, offset: 0 });
+    return data.categories.nodes ?? [];
+  }
+
+  async listLibraryMangas(categoryId: number, first = 50, offset = 0) {
+    const data = await this.graphql<{
+      mangas: { nodes: Record<string, unknown>[]; totalCount: number };
+    }>(CATEGORY_MANGAS, {
+      first,
+      offset,
+      categoryIds: [categoryId],
+    });
+    return {
+      totalCount: data.mangas.totalCount,
+      items: (data.mangas.nodes ?? []).map((n) => this.mapManga(n)),
+    };
+  }
+
+  async getManga(id: number) {
+    const data = await this.graphql<{
+      manga: Record<string, unknown> | null;
+      chapters: { nodes: Record<string, unknown>[]; totalCount: number };
+    }>(MANGA_INFO, { id, chapterFirst: 1000, chapterOffset: 0 });
+    return data;
+  }
+
+  async fetchChapters(mangaId: number) {
+    const data = await this.graphql<{
+      fetchChapters: { chapters: Record<string, unknown>[] };
+    }>(FETCH_CHAPTERS, { input: { mangaId } });
+    return data.fetchChapters.chapters ?? [];
+  }
+
+  async fetchChapterPages(chapterId: number): Promise<string[]> {
+    const data = await this.graphql<{
+      fetchChapterPages: { pages: string[]; chapter: { pageCount: number } };
+    }>(FETCH_PAGES, { input: { chapterId } });
+    return (data.fetchChapterPages.pages ?? []).map((u) => absUrl(this.baseUrl, u));
+  }
+
+  async updateProgress(chapterId: number, lastPageRead: number, isRead?: boolean) {
+    const patch: Record<string, unknown> = { lastPageRead };
+    if (isRead != null) patch.isRead = isRead;
+    await this.graphql(UPDATE_CHAPTER, {
+      input: { id: chapterId, patch },
+    });
+  }
+
+  /** Installed sources only. */
+  async listSources(isNsfw: boolean | null = false) {
+    const data = await this.graphql<{
+      sources: { nodes: SourceItem[]; totalCount: number };
+    }>(SOURCES, { isNsfw });
+    return data.sources;
+  }
+
+  private mapManga(node: Record<string, unknown>): MangaListItem {
+    const source = node.source as { id?: string; displayName?: string } | undefined;
+    return {
+      id: Number(node.id),
+      title: String(node.title ?? ""),
+      thumbnailUrl: absUrl(this.baseUrl, String(node.thumbnailUrl ?? "")),
+      sourceId: node.sourceId != null ? String(node.sourceId) : source?.id,
+      sourceName: source?.displayName,
+      unreadCount: node.unreadCount != null ? Number(node.unreadCount) : undefined,
+      inLibrary: node.inLibrary != null ? !!node.inLibrary : undefined,
+    };
+  }
+}
+
+/** Queries/mutations exported for docs & probes. */
+export const P0_OPERATIONS = {
+  VALIDATE,
+  CATEGORIES,
+  CATEGORY_MANGAS,
+  MANGA_INFO,
+  FETCH_CHAPTERS,
+  FETCH_PAGES,
+  UPDATE_CHAPTER,
+  SOURCES,
+} as const;
