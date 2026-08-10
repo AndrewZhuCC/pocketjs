@@ -110,16 +110,48 @@ mutation UPDATE_CHAPTER_PROGRESS($input: UpdateChapterInput!) {
 
 /** Installed sources only — no extension install/remove in P0. */
 const SOURCES = `
-query GET_SOURCES($isNsfw: Boolean) {
-  sources(isNsfw: $isNsfw) {
+query GET_SOURCES($first: Int!, $offset: Int!) {
+  sources(
+    first: $first
+    offset: $offset
+    order: [{ by: NAME, byType: ASC }]
+  ) {
     nodes {
       id
       name
       lang
-      isNsfw
+      iconUrl
       supportsLatest
+      isNsfw
     }
     totalCount
+    pageInfo { hasNextPage }
+  }
+}`;
+
+/** Browse one installed source: POPULAR | LATEST | SEARCH */
+const FETCH_SOURCE_MANGA = `
+mutation FETCH_SOURCE_MANGA($input: FetchSourceMangaInput!) {
+  fetchSourceManga(input: $input) {
+    mangas {
+      id
+      title
+      thumbnailUrl
+      inLibrary
+      sourceId
+      author
+      artist
+      description
+      status
+    }
+    hasNextPage
+  }
+}`;
+
+const UPDATE_MANGA_LIBRARY = `
+mutation UPDATE_MANGA_LIBRARY($input: UpdateMangaInput!) {
+  updateManga(input: $input) {
+    manga { id inLibrary }
   }
 }`;
 
@@ -252,12 +284,54 @@ export class SuwayomiClient {
     });
   }
 
-  /** Installed sources only. */
-  async listSources(isNsfw: boolean | null = false) {
+  /** Installed sources only (server-side installed extensions). */
+  async listSources(first = 100, offset = 0) {
     const data = await this.graphql<{
-      sources: { nodes: SourceItem[]; totalCount: number };
-    }>(SOURCES, { isNsfw });
+      sources: {
+        nodes: SourceItem[];
+        totalCount: number;
+        pageInfo?: { hasNextPage?: boolean };
+      };
+    }>(SOURCES, { first, offset });
     return data.sources;
+  }
+
+  /**
+   * Browse one source. `type`: POPULAR | LATEST | SEARCH.
+   * LATEST requires source.supportsLatest.
+   */
+  async fetchSourceManga(opts: {
+    sourceId: number | string;
+    type: "POPULAR" | "LATEST" | "SEARCH";
+    page: number;
+    query?: string;
+  }) {
+    const data = await this.graphql<{
+      fetchSourceManga: {
+        mangas: Record<string, unknown>[];
+        hasNextPage: boolean;
+      };
+    }>(FETCH_SOURCE_MANGA, {
+      input: {
+        source: Number(opts.sourceId),
+        type: opts.type,
+        page: opts.page,
+        query: opts.query ?? null,
+      },
+    });
+    return {
+      hasNextPage: !!data.fetchSourceManga.hasNextPage,
+      items: (data.fetchSourceManga.mangas ?? []).map((n) => this.mapManga(n)),
+    };
+  }
+
+  async setInLibrary(mangaId: number, inLibrary: boolean) {
+    const data = await this.graphql<{
+      updateManga: { manga: { id: number; inLibrary: boolean } };
+    }>(UPDATE_MANGA_LIBRARY, {
+      input: { id: mangaId, patch: { inLibrary } },
+    });
+    return data.updateManga.manga;
   }
 
   private mapManga(node: Record<string, unknown>): MangaListItem {
@@ -284,4 +358,6 @@ export const P0_OPERATIONS = {
   FETCH_PAGES,
   UPDATE_CHAPTER,
   SOURCES,
+  FETCH_SOURCE_MANGA,
+  UPDATE_MANGA_LIBRARY,
 } as const;
