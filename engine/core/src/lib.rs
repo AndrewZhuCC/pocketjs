@@ -695,8 +695,10 @@ impl Ui {
     }
 
     /// Insert a host-rasterized glyph into a loaded atlas slot (runtime CJK).
-    /// Returns false if the slot is empty, full, or coverage size mismatches.
-    /// On success layout is dirtied so the next frame remeasures text.
+    /// Returns false if the slot is empty/full, coverage size mismatches, or a
+    /// single cell cannot fit the configured global runtime budget. Existing
+    /// mappings still return true. Any insertion/eviction dirties both layout
+    /// and raster state so reused gids are never consumed with stale geometry.
     pub fn ensure_font_glyph(
         &mut self,
         slot: u8,
@@ -705,15 +707,47 @@ impl Ui {
         xoff: u8,
         coverage: &[u8],
     ) -> bool {
-        let ok = self
+        let Some(update) = self
             .fonts
-            .insert_runtime_glyph(slot, codepoint, advance, xoff, coverage)
-            .is_some();
-        if ok {
+            .ensure_runtime_glyph(slot, codepoint, advance, xoff, coverage)
+        else {
+            return false;
+        };
+        if update.changed || update.evicted {
             self.layout.dirty = true;
             self.bump_raster_revision();
         }
-        ok
+        true
+    }
+
+    /// Drain deduplicated cmap misses observed by text measurement/layout.
+    /// Each item is `(font slot, Unicode codepoint)`.
+    pub fn take_missing_font_glyphs(&self) -> Vec<(u8, u32)> {
+        self.fonts.take_missing_glyphs()
+    }
+
+    /// Configure the global host-rasterized glyph coverage budget in bytes.
+    /// Lowering the budget evicts least-recently-looked-up glyphs immediately.
+    pub fn set_runtime_glyph_budget_bytes(&mut self, bytes: usize) {
+        if self.fonts.set_runtime_budget_bytes(bytes) {
+            self.layout.dirty = true;
+            self.bump_raster_revision();
+        }
+    }
+
+    /// Configured global runtime glyph coverage budget (default 4 MiB).
+    pub fn runtime_glyph_budget_bytes(&self) -> usize {
+        self.fonts.runtime_budget_bytes()
+    }
+
+    /// Active runtime glyph coverage bytes currently retained by the LRU.
+    pub fn runtime_glyph_memory_bytes(&self) -> usize {
+        self.fonts.runtime_bytes()
+    }
+
+    /// Short alias for [`Ui::runtime_glyph_memory_bytes`].
+    pub fn runtime_glyph_bytes(&self) -> usize {
+        self.runtime_glyph_memory_bytes()
     }
 
     /// True if the codepoint is already in the slot's cmap (no tofu miss).

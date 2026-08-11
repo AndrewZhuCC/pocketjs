@@ -949,6 +949,119 @@ fn text_measurement_against_synthetic_atlas() {
 }
 
 #[test]
+fn missing_font_glyph_requests_are_deduplicated_and_drained() {
+    let mut ui = Ui::new();
+    assert!(ui.load_font_atlas(&encode_atlas(
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        &[(0xfffd, 0, 2)],
+    )));
+
+    assert_eq!(ui.measure_text("汉汉字汉", 2), 8.0);
+    assert_eq!(ui.measure_text("字汉", 2), 4.0);
+    assert_eq!(
+        ui.take_missing_font_glyphs(),
+        alloc::vec![(2, '汉' as u32), (2, '字' as u32)]
+    );
+    assert!(ui.take_missing_font_glyphs().is_empty());
+
+    // A host response removes an already-queued request immediately, and the
+    // now-mapped codepoint cannot enqueue another miss.
+    assert_eq!(ui.measure_text("语", 2), 2.0);
+    let revision = ui.raster_revision();
+    assert!(ui.ensure_font_glyph(2, '语' as u32, 3, 0, &[9, 8, 7, 6]));
+    assert!(ui.raster_revision() > revision);
+    assert!(ui.take_missing_font_glyphs().is_empty());
+    assert_eq!(ui.measure_text("语", 2), 3.0);
+    assert!(ui.take_missing_font_glyphs().is_empty());
+}
+
+#[test]
+fn runtime_glyph_budget_uses_lookup_lru_and_never_exceeds_bytes() {
+    let mut ui = Ui::new();
+    assert_eq!(
+        ui.runtime_glyph_budget_bytes(),
+        crate::text::DEFAULT_RUNTIME_GLYPH_BUDGET_BYTES
+    );
+    assert!(ui.load_font_atlas(&encode_atlas(
+        3,
+        2,
+        2,
+        2,
+        2,
+        1,
+        &[(0xfffd, 0, 2)],
+    )));
+    assert!(ui.load_font_atlas(&encode_atlas(
+        5,
+        2,
+        2,
+        2,
+        2,
+        1,
+        &[(0xfffd, 0, 2)],
+    )));
+    ui.set_runtime_glyph_budget_bytes(8); // two 2x2 cells globally
+
+    assert!(ui.ensure_font_glyph(3, '甲' as u32, 2, 0, &[1; 4]));
+    assert!(ui.ensure_font_glyph(5, '乙' as u32, 2, 0, &[2; 4]));
+    assert_eq!(ui.runtime_glyph_memory_bytes(), 8);
+    assert_eq!(ui.runtime_glyph_bytes(), 8);
+
+    // Actual text lookup, not insertion order, makes 甲 most-recently used.
+    assert_eq!(ui.measure_text("甲", 3), 2.0);
+    assert!(ui.ensure_font_glyph(3, '丙' as u32, 2, 0, &[3; 4]));
+    assert!(ui.font_has_glyph(3, '甲' as u32));
+    assert!(!ui.font_has_glyph(5, '乙' as u32));
+    assert!(ui.font_has_glyph(3, '丙' as u32));
+    assert!(ui.runtime_glyph_memory_bytes() <= ui.runtime_glyph_budget_bytes());
+
+    // A single cell larger than the whole budget is rejected without evicting
+    // the working set or exceeding the configured byte count.
+    ui.set_runtime_glyph_budget_bytes(3);
+    assert_eq!(ui.runtime_glyph_memory_bytes(), 0);
+    assert!(!ui.ensure_font_glyph(3, '丁' as u32, 2, 0, &[4; 4]));
+    assert_eq!(ui.runtime_glyph_memory_bytes(), 0);
+}
+
+#[test]
+fn runtime_gid_reuse_reads_new_bitmap_and_inactive_gid_is_transparent() {
+    let mut ui = Ui::new();
+    assert!(ui.load_font_atlas(&encode_atlas(
+        4,
+        2,
+        2,
+        2,
+        2,
+        1,
+        &[(0xfffd, 0, 2)],
+    )));
+    ui.set_runtime_glyph_budget_bytes(4); // exactly one runtime cell
+
+    assert!(ui.ensure_font_glyph(4, '甲' as u32, 2, 0, &[10, 11, 12, 13]));
+    let first_gid = ui.font_atlas(4).unwrap().lookup('甲' as u32).unwrap().0;
+    assert_eq!(ui.font_atlas(4).unwrap().glyph_rows(first_gid), &[10, 11, 12, 13]);
+
+    assert!(ui.ensure_font_glyph(4, '乙' as u32, 2, 0, &[20, 21, 22, 23]));
+    let reused_gid = ui.font_atlas(4).unwrap().lookup('乙' as u32).unwrap().0;
+    assert_eq!(reused_gid, first_gid);
+    assert!(!ui.font_has_glyph(4, '甲' as u32));
+    assert_eq!(ui.font_atlas(4).unwrap().glyph_rows(reused_gid), &[20, 21, 22, 23]);
+    assert_eq!(ui.runtime_glyph_memory_bytes(), 4);
+
+    let revision = ui.raster_revision();
+    ui.set_runtime_glyph_budget_bytes(0);
+    assert!(ui.raster_revision() > revision);
+    assert_eq!(ui.runtime_glyph_memory_bytes(), 0);
+    assert_eq!(ui.font_atlas(4).unwrap().glyph_rows(reused_gid), &[0, 0, 0, 0]);
+    assert_eq!(ui.font_atlas(4).unwrap().logical_coverage(reused_gid, 0, 0), 0);
+}
+
+#[test]
 fn font_atlas_v3_scales_coverage_without_scaling_layout_metrics() {
     let glyphs = &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)];
     let mut ui = Ui::new();
