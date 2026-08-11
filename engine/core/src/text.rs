@@ -9,8 +9,15 @@
 //! breaks only on explicit '\n'. Measurement is the max line width (sum of
 //! advances + tracking per glyph) by lines x line height.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
+
+/// Default global budget for host-rasterized glyph coverage (4 MiB).
+pub const DEFAULT_RUNTIME_GLYPH_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+/// Work queue cap: overflow is harmless because still-missing text requeues on
+/// the next layout/draw pass after the host drains this batch.
+const MAX_PENDING_GLYPH_REQUESTS: usize = 4_096;
 
 use crate::spec;
 
@@ -42,6 +49,12 @@ pub struct CmapEntry {
     pub xoff: u8,
 }
 
+struct RuntimeGlyph {
+    codepoint: Option<u32>,
+    last_used: Cell<u64>,
+    bitmap: Option<Box<[u8]>>,
+}
+
 /// One parsed font atlas (a (family-weight, px) bake bound to a slot).
 pub struct Atlas {
     /// Logical cell dimensions. Coverage dimensions are these times
@@ -56,11 +69,17 @@ pub struct Atlas {
     pub raster_density: u8,
     pub slot: u8,
     pub flags: u8,
+    /// Addressable gid count. Static gids occupy the prefix; runtime gids are
+    /// stable slots after it and may be inactive/reused after LRU eviction.
     pub glyph_count: u16,
+    static_glyph_count: u16,
     cmap: Vec<CmapEntry>,
-    /// Coverage cells: glyphCount x (cellH*density) x (cellW*density)
-    /// alpha bytes, left-to-right.
+    /// Immutable bake-time coverage cells only. Runtime cells live in
+    /// `runtime_glyphs`, so the static atlas bytes never move or change.
     pub bitmap: Vec<u8>,
+    runtime_glyphs: Vec<RuntimeGlyph>,
+    /// Returned for inactive/reclaimed runtime gids (one transparent cell).
+    zero_cell: Box<[u8]>,
 }
 
 impl Atlas {
@@ -133,8 +152,11 @@ impl Atlas {
             slot,
             flags,
             glyph_count,
+            static_glyph_count: glyph_count,
             cmap,
             bitmap,
+            runtime_glyphs: Vec::new(),
+            zero_cell: alloc::vec![0u8; coverage_h * coverage_w].into_boxed_slice(),
         })
     }
 
@@ -168,21 +190,140 @@ impl Atlas {
     }
 
     /// The density-scaled coverage bytes of one glyph (top row first).
+    /// Inactive/reclaimed runtime gids (and out-of-range gids) resolve to one
+    /// transparent fixed-size cell so stale DrawList words remain safe.
     pub fn glyph_rows(&self, gid: u16) -> &[u8] {
         let per_glyph = self.coverage_height() as usize * self.bytes_per_row();
-        let start = gid as usize * per_glyph;
-        &self.bitmap[start..start + per_glyph]
+        if gid < self.static_glyph_count {
+            let start = gid as usize * per_glyph;
+            return &self.bitmap[start..start + per_glyph];
+        }
+        let Some(runtime) = self
+            .runtime_glyphs
+            .get((gid - self.static_glyph_count) as usize)
+        else {
+            return &self.zero_cell;
+        };
+        runtime.bitmap.as_deref().unwrap_or(&self.zero_cell)
     }
 
-    /// Append a runtime-rasterized glyph (e.g. host FreeType/fontdue for CJK).
-    ///
-    /// `coverage` must be exactly `coverage_width * coverage_height` alpha
-    /// bytes (same layout as bake-time cells). Returns the new gid, or the
-    /// existing gid if `codepoint` is already mapped. `None` if the atlas is
-    /// full or the coverage length is wrong.
-    ///
-    /// gid 0 remains the tofu box; new glyphs are appended after the bake-time
-    /// set. Callers must dirty layout after a successful insert.
+    #[inline]
+    fn runtime_bytes(&self) -> usize {
+        self.runtime_glyphs
+            .iter()
+            .filter_map(|glyph| glyph.bitmap.as_ref())
+            .map(|bitmap| bitmap.len())
+            .sum()
+    }
+
+    #[inline]
+    fn touch_runtime_gid(&self, gid: u16, tick: u64) {
+        if gid < self.static_glyph_count {
+            return;
+        }
+        if let Some(glyph) = self
+            .runtime_glyphs
+            .get((gid - self.static_glyph_count) as usize)
+        {
+            if glyph.codepoint.is_some() {
+                glyph.last_used.set(tick);
+            }
+        }
+    }
+
+    fn lru_runtime_gid(&self) -> Option<(u16, u64)> {
+        self.runtime_glyphs
+            .iter()
+            .enumerate()
+            .filter(|(_, glyph)| glyph.codepoint.is_some())
+            .min_by_key(|(_, glyph)| glyph.last_used.get())
+            .map(|(index, glyph)| {
+                (
+                    self.static_glyph_count + index as u16,
+                    glyph.last_used.get(),
+                )
+            })
+    }
+
+    /// Reclaim one active runtime gid. Its cmap mapping and coverage allocation
+    /// are removed, while the gid remains addressable as a transparent cell.
+    fn evict_runtime_gid(&mut self, gid: u16) -> usize {
+        if gid < self.static_glyph_count {
+            return 0;
+        }
+        let Some(glyph) = self
+            .runtime_glyphs
+            .get_mut((gid - self.static_glyph_count) as usize)
+        else {
+            return 0;
+        };
+        let Some(codepoint) = glyph.codepoint.take() else {
+            return 0;
+        };
+        if let Ok(index) = self
+            .cmap
+            .binary_search_by(|entry| entry.codepoint.cmp(&codepoint))
+        {
+            self.cmap.remove(index);
+        }
+        glyph.last_used.set(0);
+        glyph.bitmap.take().map_or(0, |bitmap| bitmap.len())
+    }
+
+    fn insert_runtime_glyph_at(
+        &mut self,
+        codepoint: u32,
+        advance: u8,
+        xoff: u8,
+        coverage: &[u8],
+        tick: u64,
+    ) -> Option<u16> {
+        if let Some(entry) = self.lookup_entry(codepoint) {
+            self.touch_runtime_gid(entry.gid, tick);
+            return Some(entry.gid);
+        }
+        let per_glyph = self.coverage_height() as usize * self.bytes_per_row();
+        if coverage.len() != per_glyph {
+            return None;
+        }
+        let (gid, runtime_index) = if let Some(index) = self
+            .runtime_glyphs
+            .iter()
+            .position(|glyph| glyph.codepoint.is_none())
+        {
+            (self.static_glyph_count + index as u16, index)
+        } else {
+            if self.glyph_count == u16::MAX {
+                return None;
+            }
+            let gid = self.glyph_count;
+            self.glyph_count = self.glyph_count.checked_add(1)?;
+            self.runtime_glyphs.push(RuntimeGlyph {
+                codepoint: None,
+                last_used: Cell::new(0),
+                bitmap: None,
+            });
+            (gid, self.runtime_glyphs.len() - 1)
+        };
+        let glyph = &mut self.runtime_glyphs[runtime_index];
+        glyph.codepoint = Some(codepoint);
+        glyph.last_used.set(tick);
+        glyph.bitmap = Some(coverage.into());
+        let entry = CmapEntry {
+            codepoint,
+            gid,
+            advance,
+            xoff,
+        };
+        let index = self.cmap.partition_point(|entry| entry.codepoint < codepoint);
+        self.cmap.insert(index, entry);
+        Some(gid)
+    }
+
+    /// Insert a runtime-rasterized glyph into this atlas. Core users should
+    /// normally go through [`crate::Ui::ensure_font_glyph`], which enforces the
+    /// global runtime budget and LRU. This direct helper preserves the existing
+    /// Atlas API and reuses any already-reclaimed gid.
     pub fn insert_runtime_glyph(
         &mut self,
         codepoint: u32,
@@ -190,32 +331,7 @@ impl Atlas {
         xoff: u8,
         coverage: &[u8],
     ) -> Option<u16> {
-        if let Some(e) = self.lookup_entry(codepoint) {
-            return Some(e.gid);
-        }
-        let per_glyph = self.coverage_height() as usize * self.bytes_per_row();
-        if coverage.len() != per_glyph {
-            return None;
-        }
-        if self.glyph_count == u16::MAX {
-            return None;
-        }
-        let gid = self.glyph_count;
-        // Reject codepoints that would collide with an existing gid mapping of
-        // U+FFFD only — any cp is fine as long as not already present.
-        self.glyph_count = self.glyph_count.checked_add(1)?;
-        self.bitmap.extend_from_slice(coverage);
-        let ent = CmapEntry {
-            codepoint,
-            gid,
-            advance,
-            xoff,
-        };
-        let idx = self
-            .cmap
-            .partition_point(|e| e.codepoint < codepoint);
-        self.cmap.insert(idx, ent);
-        Some(gid)
+        self.insert_runtime_glyph_at(codepoint, advance, xoff, coverage, 1)
     }
 
     /// Average one logical pixel's density×density coverage samples. This is
@@ -257,6 +373,19 @@ pub struct Fonts {
     /// cmap-miss counter (Cell: measurement is `&self` per the pinned `Ui`
     /// signature but a miss must still count).
     pub misses: Cell<u32>,
+    /// Deduplicated host work queue. Layout/measurement are `&self`, so misses
+    /// use interior mutability; `take_missing_glyphs` drains it explicitly.
+    missing: RefCell<Vec<(u8, u32)>>,
+    runtime_budget_bytes: usize,
+    runtime_bytes: usize,
+    /// Monotonic LRU clock, touched by actual text glyph lookup.
+    runtime_clock: Cell<u64>,
+}
+
+pub(crate) struct RuntimeGlyphUpdate {
+    pub gid: u16,
+    pub changed: bool,
+    pub evicted: bool,
 }
 
 impl Default for Fonts {
@@ -270,15 +399,27 @@ impl Fonts {
         Fonts {
             slots: Default::default(),
             misses: Cell::new(0),
+            missing: RefCell::new(Vec::new()),
+            runtime_budget_bytes: DEFAULT_RUNTIME_GLYPH_BUDGET_BYTES,
+            runtime_bytes: 0,
+            runtime_clock: Cell::new(0),
         }
     }
 
     /// Parse + register an atlas at the slot in its header.
     pub fn load(&mut self, bytes: &[u8]) -> bool {
         match Atlas::parse(bytes) {
-            Some(a) => {
-                let slot = a.slot as usize;
-                self.slots[slot] = Some(a);
+            Some(atlas) => {
+                let slot = atlas.slot as usize;
+                if let Some(previous) = self.slots[slot].as_ref() {
+                    self.runtime_bytes = self.runtime_bytes.saturating_sub(previous.runtime_bytes());
+                }
+                self.slots[slot] = Some(atlas);
+                // A replacement atlas invalidates stale requests for this slot;
+                // still-missing codepoints will enqueue again on their next lookup.
+                self.missing
+                    .get_mut()
+                    .retain(|(missing_slot, _)| *missing_slot as usize != slot);
                 true
             }
             None => false,
@@ -295,7 +436,135 @@ impl Fonts {
         self.slots.get_mut(slot as usize)?.as_mut()
     }
 
-    /// See [`Atlas::insert_runtime_glyph`].
+    #[inline]
+    fn next_runtime_tick(&self) -> u64 {
+        let tick = self.runtime_clock.get().wrapping_add(1).max(1);
+        self.runtime_clock.set(tick);
+        tick
+    }
+
+    fn touch_runtime_glyph(&self, atlas: &Atlas, gid: u16) {
+        if gid >= atlas.static_glyph_count {
+            atlas.touch_runtime_gid(gid, self.next_runtime_tick());
+        }
+    }
+
+    fn record_missing(&self, slot: u8, codepoint: u32) {
+        let mut missing = self.missing.borrow_mut();
+        if missing.len() >= MAX_PENDING_GLYPH_REQUESTS {
+            return;
+        }
+        if !missing.contains(&(slot, codepoint)) {
+            missing.push((slot, codepoint));
+        }
+    }
+
+    fn remove_missing(&mut self, slot: u8, codepoint: u32) {
+        self.missing
+            .get_mut()
+            .retain(|request| *request != (slot, codepoint));
+    }
+
+    fn lru_runtime_glyph(&self) -> Option<(u8, u16)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, atlas)| {
+                let (gid, tick) = atlas.as_ref()?.lru_runtime_gid()?;
+                Some((tick, slot as u8, gid))
+            })
+            .min_by_key(|(tick, _, _)| *tick)
+            .map(|(_, slot, gid)| (slot, gid))
+    }
+
+    fn evict_lru_runtime_glyph(&mut self) -> bool {
+        let Some((slot, gid)) = self.lru_runtime_glyph() else {
+            return false;
+        };
+        let freed = self
+            .atlas_mut(slot)
+            .map_or(0, |atlas| atlas.evict_runtime_gid(gid));
+        self.runtime_bytes = self.runtime_bytes.saturating_sub(freed);
+        freed != 0
+    }
+
+    pub fn runtime_budget_bytes(&self) -> usize {
+        self.runtime_budget_bytes
+    }
+
+    pub fn runtime_bytes(&self) -> usize {
+        self.runtime_bytes
+    }
+
+    /// Set the global runtime coverage budget. Returns true when lowering it
+    /// evicted at least one glyph.
+    pub fn set_runtime_budget_bytes(&mut self, bytes: usize) -> bool {
+        self.runtime_budget_bytes = bytes;
+        let mut evicted = false;
+        while self.runtime_bytes > self.runtime_budget_bytes {
+            if !self.evict_lru_runtime_glyph() {
+                break;
+            }
+            evicted = true;
+        }
+        evicted
+    }
+
+    /// Drain the deduplicated `(font slot, Unicode codepoint)` host work queue.
+    pub fn take_missing_glyphs(&self) -> Vec<(u8, u32)> {
+        core::mem::take(&mut *self.missing.borrow_mut())
+    }
+
+    pub(crate) fn ensure_runtime_glyph(
+        &mut self,
+        slot: u8,
+        codepoint: u32,
+        advance: u8,
+        xoff: u8,
+        coverage: &[u8],
+    ) -> Option<RuntimeGlyphUpdate> {
+        let atlas = self.atlas(slot)?;
+        if let Some(entry) = atlas.lookup_entry(codepoint) {
+            let gid = entry.gid;
+            self.touch_runtime_glyph(atlas, gid);
+            self.remove_missing(slot, codepoint);
+            return Some(RuntimeGlyphUpdate {
+                gid,
+                changed: false,
+                evicted: false,
+            });
+        }
+        let per_glyph = atlas.coverage_height() as usize * atlas.bytes_per_row();
+        if coverage.len() != per_glyph
+            || per_glyph > self.runtime_budget_bytes
+            || (atlas.runtime_glyphs.iter().all(|glyph| glyph.codepoint.is_some())
+                && atlas.glyph_count == u16::MAX)
+        {
+            return None;
+        }
+
+        let mut evicted = false;
+        while self.runtime_bytes.saturating_add(per_glyph) > self.runtime_budget_bytes {
+            if !self.evict_lru_runtime_glyph() {
+                return None;
+            }
+            evicted = true;
+        }
+        let tick = self.next_runtime_tick();
+        let gid = self
+            .atlas_mut(slot)?
+            .insert_runtime_glyph_at(codepoint, advance, xoff, coverage, tick)?;
+        self.runtime_bytes += per_glyph;
+        self.remove_missing(slot, codepoint);
+        Some(RuntimeGlyphUpdate {
+            gid,
+            changed: true,
+            evicted,
+        })
+    }
+
+    /// See [`Atlas::insert_runtime_glyph`]. This compatibility helper now goes
+    /// through the global budgeted LRU.
     pub fn insert_runtime_glyph(
         &mut self,
         slot: u8,
@@ -304,17 +573,22 @@ impl Fonts {
         xoff: u8,
         coverage: &[u8],
     ) -> Option<u16> {
-        self.atlas_mut(slot)?
-            .insert_runtime_glyph(codepoint, advance, xoff, coverage)
+        self.ensure_runtime_glyph(slot, codepoint, advance, xoff, coverage)
+            .map(|update| update.gid)
     }
 
     /// (gid, advance, xoff) for a codepoint; a miss resolves to gid 0 (tofu,
-    /// cell width advance) and bumps the miss counter.
+    /// cell width advance), bumps the miss counter, and queues deduplicated host
+    /// raster work. Runtime hits update the global LRU at actual lookup time.
     fn glyph(&self, atlas: &Atlas, cp: u32) -> (u16, f32, f32) {
         match atlas.lookup_entry(cp) {
-            Some(e) => (e.gid, e.advance as f32, e.xoff as f32),
+            Some(entry) => {
+                self.touch_runtime_glyph(atlas, entry.gid);
+                (entry.gid, entry.advance as f32, entry.xoff as f32)
+            }
             None => {
                 self.misses.set(self.misses.get().wrapping_add(1));
+                self.record_missing(atlas.slot, cp);
                 (0, atlas.cell_w as f32, 0.0)
             }
         }

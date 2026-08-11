@@ -45,6 +45,15 @@ describe("font atlas density", () => {
     expect(coverage.some((sample) => sample > 0 && sample < 255)).toBe(true);
   });
 
+  test("reserves a fullwidth runtime cell without changing density semantics", () => {
+    const tight = bakeSlot(font, 0, 16, false, [0x41], 4);
+    const reserved = bakeSlot(font, 0, 16, false, [0x41], 4, null, true);
+    expect(reserved.cellW).toBeGreaterThanOrEqual(16);
+    expect(reserved.cellW).toBeGreaterThanOrEqual(tight.cellW);
+    expect(reserved.coverageW).toBe(reserved.cellW * 4);
+    expect(reserved.coverageH).toBe(reserved.cellH * 4);
+  });
+
   test("rejects densities outside the one-byte v3 contract", () => {
     expect(() => bakeSlot(font, 0, 16, false, codepoints, 0)).toThrow(/rasterDensity/);
     expect(() => bakeSlot(font, 0, 16, false, codepoints, 1.5)).toThrow(/rasterDensity/);

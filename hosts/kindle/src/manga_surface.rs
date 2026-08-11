@@ -51,8 +51,6 @@ struct Shared {
     next_job: AtomicU32,
     jobs: Mutex<HashMap<u32, JobState>>,
     http_results: Mutex<HashMap<u32, HttpResult>>,
-    /// Text waiting for runtime font injection (drained on host tick).
-    ensure_chars: Mutex<String>,
     panel_w: usize,
     panel_h: usize,
     /// Sandbox root for readFile/writeFile (…/pocketjs-dev).
@@ -85,7 +83,6 @@ impl MangaSurface {
                 next_job: AtomicU32::new(1),
                 jobs: Mutex::new(HashMap::new()),
                 http_results: Mutex::new(HashMap::new()),
-                ensure_chars: Mutex::new(String::new()),
                 panel_w,
                 panel_h,
                 data_root,
@@ -223,32 +220,9 @@ impl MangaSurface {
                 })?,
             )?;
 
-            // Queue characters for host-side fontdue injection into font atlases.
-            let s_ec = surface.clone();
-            ns.set(
-                "ensureChars",
-                Function::new(ns.ctx().clone(), move |text: String| {
-                    if text.is_empty() {
-                        return;
-                    }
-                    if let Ok(mut buf) = s_ec.inner.ensure_chars.lock() {
-                        buf.push_str(&text);
-                    }
-                })?,
-            )?;
-
             ns.set("available", true)?;
             Ok(())
         })
-    }
-
-    /// Drain queued characters for runtime font injection (one host tick).
-    pub fn take_ensure_chars(&self) -> Option<String> {
-        let mut buf = self.inner.ensure_chars.lock().ok()?;
-        if buf.is_empty() {
-            return None;
-        }
-        Some(std::mem::take(&mut *buf))
     }
 
     fn start_load(&self, url: String, cookie: Option<String>, show: bool) -> i32 {

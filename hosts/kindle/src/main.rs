@@ -306,7 +306,7 @@ impl AppRuntime {
             geometry.density as u32,
         );
         surface.set_identity(HOST_ID, HOST_ABI);
-        surface.feed_pak(&pak);
+        surface.feed_pak_owned(pak);
         let manga = MangaSurface::new(terminate, geometry.render_w, geometry.render_h);
         let guest = Guest::new().context("creating PocketJS guest")?;
         surface.mount(&guest).context("mounting UI surface")?;
@@ -347,18 +347,37 @@ impl AppRuntime {
             .frame_with_touches(0, spec::ANALOG_CENTER, touches)
             .context("PocketJS guest frame")?;
 
-        // After the guest turn: JS may have setText + ensureChars in the same
-        // frame. Inject glyphs now so tick()/draw() see real coverage, not tofu.
-        if let Some(chars) = self.manga.take_ensure_chars() {
-            self.surface.with_ui(|ui| {
-                let n = runtime_font::ensure_chars_on_ui(ui, &chars).unwrap_or(0);
-                if n > 0 {
-                    log::info!("runtime_font: ensured {n} new glyph(s)");
-                }
-            });
-        }
-
         self.surface.tick();
+
+        // Build once without presenting, drain cmap misses, rasterize only the
+        // requested (slot, codepoint) pairs, then rebuild. A bounded settle loop
+        // prevents a tofu frame from ever reaching the e-ink panel while still
+        // advancing animations exactly once per host tick.
+        const FONT_SETTLE_PASSES: usize = 4;
+        let mut ensured = 0u32;
+        for _ in 0..FONT_SETTLE_PASSES {
+            let requests = self.surface.with_ui(|ui| {
+                let _ = ui.draw();
+                ui.take_missing_font_glyphs()
+            });
+            if requests.is_empty() {
+                break;
+            }
+            let inserted = self.surface.with_ui(|ui| {
+                runtime_font::resolve_missing_on_ui(ui, &requests).unwrap_or_else(|error| {
+                    log::warn!("runtime_font: resolving misses failed: {error:#}");
+                    0
+                })
+            });
+            ensured = ensured.saturating_add(inserted);
+            if inserted == 0 {
+                break;
+            }
+        }
+        if ensured > 0 {
+            let bytes = self.surface.with_ui(|ui| ui.runtime_glyph_memory_bytes());
+            log::info!("runtime_font: ensured {ensured} glyph(s), cache={bytes} bytes");
+        }
         let damage = &mut self.damage;
         // Keep page-number overlay in sync (black digits on full-bleed art).
         damage.set_progress_overlay(&self.manga.progress_text());

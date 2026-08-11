@@ -18,8 +18,6 @@ export type MangaHost = {
   httpTake?: (id: number) => string;
   readFile?: (rel: string) => string;
   writeFile?: (rel: string, text: string) => number;
-  /** Queue chars for host fontdue → atlas (dynamic CJK titles). */
-  ensureChars?: (text: string) => void;
 };
 
 export type HttpResult = {
@@ -131,10 +129,4 @@ export function readConfigFile(rel: string): string {
 
 export function writeConfigFile(rel: string, text: string): boolean {
   return (getMangaHost()?.writeFile?.(rel, text) ?? 0) === 1;
-}
-
-/** Ask host to rasterize any missing glyphs (CJK) into the live font atlas. */
-export function ensureChars(text: string): void {
-  if (!text) return;
-  getMangaHost()?.ensureChars?.(text);
 }

@@ -52,8 +52,10 @@ pub struct DamageTracker {
     /// Last manga page underlay (panel-sized Gray8). Kept across frames so a
     /// full UI raster (which clears to black) cannot permanently wipe the page.
     underlay: Option<Vec<u8>>,
-    /// "12/32" burned as near-black pixels each frame (floats on art).
+    /// "12/32" burned as near-black pixels (floats on art).
     progress_overlay: String,
+    /// Re-stamp progress on next rasterize (text changed or page seeded).
+    progress_dirty: bool,
 }
 
 impl DamageTracker {
@@ -68,12 +70,17 @@ impl DamageTracker {
             draw: DrawDamageTracker::new(),
             underlay: None,
             progress_overlay: String::new(),
+            progress_dirty: false,
         }
     }
 
     pub fn set_progress_overlay(&mut self, text: &str) {
+        if self.progress_overlay == text {
+            return;
+        }
         self.progress_overlay.clear();
         self.progress_overlay.push_str(text);
+        self.progress_dirty = true;
     }
 
     pub fn current(&self) -> &[u8] {
@@ -109,6 +116,7 @@ impl DamageTracker {
             }
         }
         self.candidates.fill(true);
+        self.progress_dirty = true;
         // Invalidate draw snapshot so next raster starts clean on top of underlay.
         self.draw = DrawDamageTracker::new();
     }
@@ -149,12 +157,16 @@ impl DamageTracker {
 
     /// Incrementally repaint DrawList damage into the persistent Gray8 frame.
     ///
-    /// With a manga underlay the engine's per-region black clear would erase the
-    /// page. We therefore always re-base from the underlay after UI raster and
-    /// only keep UI pixels in the reader chrome bands (top loading + bottom
-    /// progress/menu). That makes show/hide chrome safe without cropping art.
+    /// With a manga underlay we must NOT full-copy the page every frame (2MB×60Hz
+    /// starves the Kindle and the process gets killed before inject taps land).
+    /// Steady frames are no-ops; only UI damage / progress changes recompose.
     pub fn rasterize(&mut self, ui: &Ui, words: &[u32]) {
-        let plan = match raster::render_scaled_gray8_incremental(
+        let has_underlay = self
+            .underlay
+            .as_ref()
+            .is_some_and(|u| u.len() == self.current.len());
+
+        match raster::render_scaled_gray8_incremental(
             ui,
             words,
             &mut self.current,
@@ -163,24 +175,39 @@ impl DamageTracker {
             DamagePolicy::default(),
         ) {
             Ok(plan) => {
-                self.mark_candidates(plan.regions());
-                Some(plan)
+                let regions = plan.regions();
+                self.mark_candidates(regions);
+                if has_underlay {
+                    if !regions.is_empty() {
+                        self.repair_and_composite_chrome(regions);
+                    } else if self.progress_dirty {
+                        self.restamp_progress_only();
+                    }
+                }
             }
             Err(error) => {
                 log::warn!("kindle damage planner fell back to full raster: {error:?}");
+                if has_underlay {
+                    if let Some(ref under) = self.underlay {
+                        self.current.copy_from_slice(under);
+                    }
+                    self.restamp_progress_only();
+                    // Full UI redraw on top would need a side buffer; for manga
+                    // reader the common path is incremental. Mark full dirty.
+                    self.draw.invalidate();
+                    self.candidates.fill(true);
+                } else {
                 raster::render_scaled_gray8(ui, words, &mut self.current, self.density);
                 self.draw.invalidate();
                 self.candidates.fill(true);
-                None
             }
-        };
-        let _ = plan;
-        self.composite_underlay_with_chrome_bands();
+            }
+        }
     }
 
-    /// `current` holds post-UI pixels (possibly black-cleared). Rebuild as
-    /// underlay + chrome bands copied from the UI result.
-    fn composite_underlay_with_chrome_bands(&mut self) {
+    /// After UI damage cleared holes to black: restore underlay in those
+    /// regions, then keep structured bottom menu / top loading if present.
+    fn repair_and_composite_chrome(&mut self, regions: &[DamageRect]) {
         let Some(under) = self.underlay.as_ref() else {
             return;
         };
@@ -190,23 +217,29 @@ impl DamageTracker {
         let d = self.density as usize;
         let w = self.width;
         let h = self.height;
-        let ui = self.current.clone();
-        // Full-bleed page first — no reserved margin for page numbers.
-        self.current.copy_from_slice(under);
-        // Black progress digits float on the art (bottom-left).
-        if !self.progress_overlay.is_empty() {
-            crate::manga_surface::stamp_progress_black(
-                &mut self.current,
-                w,
-                h,
-                self.progress_overlay.as_str(),
-            );
+
+        // 1) Restore page pixels wherever the engine left pure black clear.
+        {
+            let current = &mut self.current;
+            for region in regions {
+                let x0 = (region.x0.max(0) as usize * d).min(w);
+                let y0 = (region.y0.max(0) as usize * d).min(h);
+                let x1 = (region.x1.max(0) as usize * d).min(w);
+                let y1 = (region.y1.max(0) as usize * d).min(h);
+                for y in y0..y1 {
+                    let row = y * w;
+                    for x in x0..x1 {
+                        let i = row + x;
+                        if current[i] == 0 {
+                            current[i] = under[i];
+                        }
+                    }
+                }
+            }
         }
 
-        // Bottom menu: real chrome is 3 differently-colored buttons, NOT a
-        // flat app-background strip (#f2efe6 → gray≈239) which we used to
-        // mis-detect as "beige menu" and paint over the page (user-visible
-        // fake bottom gutter).
+        // 2) Structured 3-button menu? keep UI bottom band (already in current
+        //    where non-zero); flat app-bg must not win — already restored above.
         let menu_h = (52 * d).min(h);
         let menu0 = h - menu_h;
         let third = w / 3;
@@ -216,7 +249,7 @@ impl DamageTracker {
             for y in menu0..h {
                 let row = y * w;
                 for x in x0..x1.min(w) {
-                    s += ui[row + x] as u64;
+                    s += self.current[row + x] as u64;
                     n += 1;
                 }
             }
@@ -230,28 +263,40 @@ impl DamageTracker {
         let m1 = band_mean(third, third * 2);
         let m2 = band_mean(third * 2, w);
         let spread = (m0 - m1).abs().max((m1 - m2).abs()).max((m0 - m2).abs());
-        // Structured 3-button menu has noticeable per-column mean spread;
-        // flat #f2efe6 residue has spread ≈ 0.
-        let menu = spread > 8.0 && m0 > 20.0 && m1 > 20.0 && m2 > 20.0;
+        let menu = spread > 8.0 && m0 > 30.0 && m1 > 30.0 && m2 > 30.0;
         if menu {
-            self.current[menu0 * w..].copy_from_slice(&ui[menu0 * w..]);
-            if !self.progress_overlay.is_empty() {
+            // Re-stamp progress over menu so digits stay visible.
+            self.restamp_progress_only();
+        } else {
+            // Ensure progress corner is page+digits (UI may have punched holes).
+            self.restamp_progress_only();
+        }
+    }
+
+    fn restamp_progress_only(&mut self) {
+        let Some(under) = self.underlay.as_ref() else {
+            self.progress_dirty = false;
+            return;
+        };
+        if under.len() != self.current.len() || self.progress_overlay.is_empty() {
+            self.progress_dirty = false;
+            return;
+        }
+        let w = self.width;
+        let h = self.height;
+        // Restore a small bottom-left patch from clean underlay, then burn digits.
+        let pw = 160usize.min(w);
+        let ph = 48usize.min(h);
+        for y in (h - ph)..h {
+            let row = y * w;
+            self.current[row..row + pw].copy_from_slice(&under[row..row + pw]);
+        }
                 crate::manga_surface::stamp_progress_black(
                     &mut self.current,
                     w,
                     h,
                     self.progress_overlay.as_str(),
                 );
-            }
-            let cols = self.width.div_ceil(TILE);
-            for tile_y in menu0 / TILE..h.div_ceil(TILE) {
-                for tile_x in 0..cols {
-                    self.candidates[tile_y * cols + tile_x] = true;
-                }
-            }
-        } else if !self.progress_overlay.is_empty() {
-            let pw = (120usize).min(w);
-            let ph = (40usize).min(h);
             let cols = self.width.div_ceil(TILE);
             for tile_y in (h - ph) / TILE..h.div_ceil(TILE) {
                 for tile_x in 0..pw.div_ceil(TILE) {
@@ -261,40 +306,7 @@ impl DamageTracker {
                     }
                 }
             }
-        }
-
-        // Top loading banner only if a compact dark pill is present.
-        let top = (32 * d).min(h);
-        let mut dark = 0usize;
-        let mut dark_min_x = w;
-        let mut dark_max_x = 0usize;
-        for y in 0..top {
-            for x in 0..w {
-                if ui[y * w + x] < 0x50 {
-                    dark += 1;
-                    dark_min_x = dark_min_x.min(x);
-                    dark_max_x = dark_max_x.max(x);
-                }
-            }
-        }
-        let pill_w = dark_max_x.saturating_sub(dark_min_x);
-        if dark > 50 && pill_w < w * 2 / 3 && pill_w > d * 20 {
-            for y in 0..top {
-                let row = y * w;
-                for x in dark_min_x.saturating_sub(4)..=(dark_max_x + 4).min(w - 1) {
-                    let i = row + x;
-                    if ui[i] > 0 {
-                        self.current[i] = ui[i];
-                    }
-                }
-            }
-            let cols = self.width.div_ceil(TILE);
-            for tile_y in 0..top.div_ceil(TILE) {
-                for tile_x in 0..cols {
-                    self.candidates[tile_y * cols + tile_x] = true;
-                }
-            }
-        }
+        self.progress_dirty = false;
     }
 
     fn mark_candidates(&mut self, regions: &[DamageRect]) {

@@ -66,6 +66,8 @@ export interface BakeOptions {
   extraChars?: string;
   /** Raster samples per logical pixel. Defaults to 1. */
   rasterDensity?: number;
+  /** Reserve at least one em of cell width for host-injected fullwidth glyphs. */
+  reserveEmCell?: boolean;
   /** Primary face (Inter by default) — Latin / general. */
   regularTtf?: string;
   boldTtf?: string;
@@ -81,11 +83,15 @@ export interface BakeOptions {
 /** Codepoints that should prefer a CJK companion face when one is configured. */
 export function isCjkCodepoint(cp: number): boolean {
   return (
-    (cp >= 0x3000 && cp <= 0x303f) || // CJK symbols & punctuation
+    (cp >= 0x2e80 && cp <= 0x2fff) || // radicals + ideographic description
+    (cp >= 0x3000 && cp <= 0x30ff) || // CJK punctuation + kana
+    (cp >= 0x3100 && cp <= 0x31ef) || // bopomofo + CJK strokes
     (cp >= 0x3400 && cp <= 0x4dbf) || // CJK ext A
     (cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+    (cp >= 0xac00 && cp <= 0xd7af) || // Hangul syllables/jamo
     (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
-    (cp >= 0xff00 && cp <= 0xffef) // half/fullwidth forms
+    (cp >= 0xff00 && cp <= 0xffef) || // half/fullwidth forms
+    (cp >= 0x20000 && cp <= 0x323af) // CJK extensions B through H
   );
 }
 
@@ -288,6 +294,7 @@ export function bakeSlot(
   chars: number[],
   rasterDensity = 1,
   cjkFont?: Font | null,
+  reserveEmCell = false,
 ): BakedAtlas {
   rasterDensity = checkedRasterDensity(rasterDensity);
   // Line metrics always come from the primary (Latin) face so mixed-script
@@ -369,7 +376,9 @@ export function bakeSlot(
   }
 
   const tofuW = Math.max(4, Math.round(px * 0.55));
-  let cellW = tofuW;
+  // Runtime providers rasterize into the same fixed-size cell. Kindle's
+  // ASCII-only bake therefore reserves one logical em for fullwidth CJK ink.
+  let cellW = reserveEmCell ? Math.max(tofuW, Math.ceil(px)) : tofuW;
   for (const g of glyphs) cellW = Math.max(cellW, Math.ceil(g.maxX));
   cellW = Math.min(255, Math.max(1, cellW));
 
@@ -478,7 +487,9 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
         cjk = cjkFonts[cjkKey];
       }
     }
-    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, cjk));
+    results.push(
+      bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, cjk, opts.reserveEmCell),
+    );
   }
   return results;
 }

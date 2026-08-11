@@ -294,26 +294,34 @@ console.log(
     `${Object.keys(styles.ids).length} literal(s) -> framework/src/styles.generated.ts`,
 );
 
-// Inter (default) has no CJK. When the app harvests Han ideographs from
-// *source literals*, attach Noto Sans SC as a companion face so static UI
-// Chinese is not tofu.
-//
-// Dynamic API text (manga titles) is NOT harvested here — Kindle host injects
-// those at runtime via fontdue (manga.ensureChars). Do NOT bake cjk-common.txt
-// into the pak: ~2k glyphs @4x blew the package to ~47MB and OOM-killed the
-// device (launcher status 137).
+// Kindle uses core-driven cmap misses plus a host-side lazy outline provider:
+// no CJK source literal or --extra-chars entry belongs in its immutable atlas.
+// Other targets retain the existing Inter + Noto companion behavior until they
+// adopt the same runtime-provider contract.
+const runtimeCjkProvider = buildPlan?.target.id.startsWith("kindle-") ?? false;
+const atlasCodepoints = runtimeCjkProvider
+  ? new Set([...codepoints].filter((cp) => !isCjkCodepoint(cp)))
+  : codepoints;
+const atlasExtraChars = runtimeCjkProvider
+  ? [...extraChars].filter((ch) => !isCjkCodepoint(ch.codePointAt(0)!)).join("")
+  : extraChars;
+if (runtimeCjkProvider) {
+  const omitted = codepoints.size - atlasCodepoints.size;
+  console.log(
+    `  font: Kindle lazy CJK provider — omitted ${omitted} source glyph(s), reserved fullwidth cells`,
+  );
+}
+
 let cjkRegularPath: string | undefined;
 let cjkBoldPath: string | undefined;
-const needsCjk = [...codepoints].some(isCjkCodepoint);
+const needsCjk = [...atlasCodepoints].some(isCjkCodepoint);
 if (needsCjk) {
   const cjkRegular = join(ROOT, "assets/fonts/NotoSansSC-Regular.otf");
   const cjkBold = join(ROOT, "assets/fonts/NotoSansSC-Bold.otf");
   if (existsSync(cjkRegular)) {
     cjkRegularPath = cjkRegular;
     cjkBoldPath = existsSync(cjkBold) ? cjkBold : cjkRegular;
-    console.log(
-      "  font: CJK literals — Inter + Noto companion (dynamic titles → host runtime_font)",
-    );
+    console.log("  font: CJK literals — Inter + Noto companion");
   } else {
     console.warn(
       "  font: CJK literals present but NotoSansSC-Regular.otf missing; " +
@@ -323,10 +331,11 @@ if (needsCjk) {
 }
 
 const atlases = await bakeAtlases({
-  codepoints,
+  codepoints: atlasCodepoints,
   slots: styles.usedFontSlots,
-  extraChars,
+  extraChars: atlasExtraChars,
   rasterDensity,
+  reserveEmCell: runtimeCjkProvider,
   regularTtf: regularFontPath,
   boldTtf: boldFontPath,
   cjkRegularTtf: cjkRegularPath,

@@ -143,12 +143,23 @@ impl UiSurface {
         matched
     }
 
-    /// Feed an app pak: styles + font atlases go straight to the core,
-    /// images/sprites upload as core textures. Call before `mount`.
+    /// Feed an app pak by borrowing the caller's bytes. Prefer
+    /// [`UiSurface::feed_pak_owned`] when the caller already owns a `Vec<u8>`.
     pub fn feed_pak(&self, pak: &[u8]) {
+        self.feed_pak_owned(pak.to_vec());
+    }
+
+    /// Feed an app pak without cloning the whole package. The owned bytes are
+    /// retained only when lazy `ui:tile.*` entries require later random access;
+    /// ordinary styles/fonts/images are copied into their final core storage and
+    /// the package allocation is released before returning.
+    pub fn feed_pak_owned(&self, pak: Vec<u8>) {
+        let entries = walk_pak(&pak);
+        let retain_for_tiles = entries
+            .iter()
+            .any(|entry| entry.key.starts_with("ui:tile."));
         let mut inner = self.inner.borrow_mut();
-        inner.pak = pak.to_vec();
-        for entry in walk_pak(pak) {
+        for entry in entries {
             if entry.key == "ui:styles" {
                 if !inner.ui.load_styles(entry.blob) {
                     log::warn!("pocket-ui: bad styles.bin in pak");
@@ -206,6 +217,7 @@ impl UiSurface {
             }
             // unknown keys: ignored (forward compatible)
         }
+        inner.pak = if retain_for_tiles { pak } else { Vec::new() };
     }
 
     /// Advance the core one fixed-dt frame (call once per host tick, after

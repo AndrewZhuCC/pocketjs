@@ -4,7 +4,6 @@ import { onFrame } from "@pocketjs/framework/lifecycle";
 import { touches } from "@pocketjs/framework/input";
 import {
   clearPage,
-  ensureChars,
   getMangaHost,
   hostHttp,
   jobStatus,
@@ -198,7 +197,6 @@ export default function MangaApp() {
       if (idx < 0) idx = 0;
       setCatIndex(idx);
       const pick = mapped[idx];
-      if (pick) ensureChars(pick.name);
       await loadCategory(cl, pick.id);
       setScreen("shelf");
     } catch (e) {
@@ -220,11 +218,6 @@ export default function MangaApp() {
     }
     setMangas(items);
     setMangaIndex(0);
-    // Visible window only — runtime CJK is stubbed (OOM); keep call cheap.
-    const win = items.slice(0, 8).map((m) => m.title).join("");
-    ensureChars(win);
-    const catName = catMeta?.name ?? "";
-    if (catName) ensureChars(catName);
     setStatus(`${items.length}/${totalCount}部`);
   }
 
@@ -236,7 +229,6 @@ export default function MangaApp() {
     try {
       setCurrentMangaId(item.id);
       setDetailTitle(item.title);
-      ensureChars(item.title);
       let data = await cl.getManga(item.id);
       let nodes = data.chapters?.nodes ?? [];
       if (!nodes.length) {
@@ -257,7 +249,6 @@ export default function MangaApp() {
       // API returns DESC sourceOrder; keep as-is for newest-first list.
       setChapters(list);
       setChapterIndex(0);
-      ensureChars(list.slice(0, 10).map((c) => c.name).join(""));
       setScreen("detail");
       setStatus(`${list.length}话`);
     } catch (e) {
