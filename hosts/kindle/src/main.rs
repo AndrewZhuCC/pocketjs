@@ -3,9 +3,12 @@
 mod damage;
 mod framebuffer;
 mod geometry;
+mod inject;
 mod input;
+mod manga_surface;
 mod refresh;
 mod remote_image;
+mod runtime_font;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +20,7 @@ use damage::{DamageTracker, Rect};
 use framebuffer::Framebuffer;
 use geometry::{Geometry, Rotation, compatible_reported_rotation};
 use input::Input;
+use manga_surface::MangaSurface;
 use pocket_mod::Guest;
 use pocket_ui_surface::UiSurface;
 use pocketjs_core::spec;
@@ -287,10 +291,11 @@ struct AppRuntime {
     guest: Guest,
     surface: UiSurface,
     damage: DamageTracker,
+    manga: MangaSurface,
 }
 
 impl AppRuntime {
-    fn load(args: &Args, geometry: &Geometry) -> Result<Self> {
+    fn load(args: &Args, geometry: &Geometry, terminate: Arc<AtomicBool>) -> Result<Self> {
         let pak = std::fs::read(&args.pak)
             .with_context(|| format!("reading pak {}", args.pak.display()))?;
         let js = std::fs::read_to_string(&args.js)
@@ -302,8 +307,10 @@ impl AppRuntime {
         );
         surface.set_identity(HOST_ID, HOST_ABI);
         surface.feed_pak(&pak);
+        let manga = MangaSurface::new(terminate, geometry.render_w, geometry.render_h);
         let guest = Guest::new().context("creating PocketJS guest")?;
         surface.mount(&guest).context("mounting UI surface")?;
+        manga.mount(&guest).context("mounting manga surface")?;
         guest.eval("app", &js).context("evaluating app bundle")?;
         if !guest.has_frame() {
             bail!(
@@ -319,21 +326,57 @@ impl AppRuntime {
                 geometry.render_h,
                 geometry.density as u32,
             ),
+            manga,
         })
     }
 
-    fn tick(&mut self, touches: &[u32]) -> Result<Vec<Rect>> {
+    fn tick(&mut self, touches: &[u32]) -> Result<(Vec<Rect>, bool)> {
+        // Apply any newly-ready page underlay before the guest paints chrome.
+        let mut force_full = false;
+        if let Some(page) = self.manga.take_page_dirty() {
+            self.damage
+                .seed_underlay(page.as_ref().map(|p| p.pixels.as_slice()));
+            force_full = true;
+            log::info!(
+                "manga underlay {}: seeding damage buffer",
+                if page.is_some() { "set" } else { "cleared" }
+            );
+        }
+
         self.guest
             .frame_with_touches(0, spec::ANALOG_CENTER, touches)
             .context("PocketJS guest frame")?;
+
+        // After the guest turn: JS may have setText + ensureChars in the same
+        // frame. Inject glyphs now so tick()/draw() see real coverage, not tofu.
+        if let Some(chars) = self.manga.take_ensure_chars() {
+            self.surface.with_ui(|ui| {
+                let n = runtime_font::ensure_chars_on_ui(ui, &chars).unwrap_or(0);
+                if n > 0 {
+                    log::info!("runtime_font: ensured {n} new glyph(s)");
+                }
+            });
+        }
+
         self.surface.tick();
         let damage = &mut self.damage;
+        // Keep page-number overlay in sync (black digits on full-bleed art).
+        damage.set_progress_overlay(&self.manga.progress_text());
         self.surface.with_ui(|ui| {
             let words = ui.draw().words.clone();
             damage.rasterize(ui, &words);
         });
-        let dirty = self.damage.diff();
-        Ok(dirty)
+        let dirty = if force_full {
+            vec![Rect {
+                x: 0,
+                y: 0,
+                w: self.damage.width(),
+                h: self.damage.height(),
+            }]
+        } else {
+            self.damage.diff()
+        };
+        Ok((dirty, force_full))
     }
 }
 
@@ -446,13 +489,13 @@ fn main() -> Result<()> {
         args.motion_waveform,
         args.ghost_budget,
     )?;
-    let mut runtime = AppRuntime::load(&args, &geometry)?;
-
     let reload = Arc::new(AtomicBool::new(false));
     let terminate = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGHUP, reload.clone()).context("registering SIGHUP")?;
     signal_hook::flag::register(SIGINT, terminate.clone()).context("registering SIGINT")?;
     signal_hook::flag::register(SIGTERM, terminate.clone()).context("registering SIGTERM")?;
+
+    let mut runtime = AppRuntime::load(&args, &geometry, terminate.clone())?;
 
     log::info!(
         "kindle runtime ready: logic=60Hz, present={}Hz, motion={:?}, pid={}",
@@ -473,12 +516,21 @@ fn main() -> Result<()> {
     let mut first_frame = true;
     let mut force_refresh = false;
     let mut exit_hold_since: Option<Instant> = None;
+    let mut injector = inject::Injector::new();
+    log::info!(
+        "kindle inject: write commands to {} (tap-logical X Y | shot)",
+        PathBuf::from(
+            std::env::var_os("POCKETJS_DEV_ROOT").unwrap_or_else(|| "/mnt/us/pocketjs-dev".into())
+        )
+        .join("run/cmd")
+        .display()
+    );
 
     while !terminate.load(Ordering::Relaxed) {
         if reload.swap(false, Ordering::AcqRel) {
             // This point is between guest turns. Keep the old realm alive if
             // a deploy is incomplete or the new bundle throws during boot.
-            match AppRuntime::load(&args, &geometry) {
+            match AppRuntime::load(&args, &geometry, terminate.clone()) {
                 Ok(next) => {
                     runtime = next;
                     pending.clear();
@@ -494,7 +546,13 @@ fn main() -> Result<()> {
 
         let mut catchup = 0;
         while Instant::now() >= next_tick && catchup < MAX_CATCHUP_TICKS {
-            let touches = input.poll_touches(&geometry)?;
+            // Agent inject overrides the digitizer while a synthetic tap is
+            // in flight (exclusive grab would block external sendevent anyway).
+            let touches = if let Some(synth) = injector.tick(&geometry) {
+                synth
+            } else {
+                input.poll_touches(&geometry)?
+            };
             if exit_hold_active(&touches) {
                 let since = exit_hold_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= EXIT_HOLD {
@@ -512,7 +570,11 @@ fn main() -> Result<()> {
             // against the preceding 60Hz simulation frame. This bounds damage
             // while FBInk is busy and lets A -> B -> A disappear before a
             // slower physical present.
-            pending = runtime.tick(&touches)?;
+            let (dirty, page_full) = runtime.tick(&touches)?;
+            pending = dirty;
+            if page_full {
+                force_refresh = true;
+            }
             next_tick += LOGIC_TICK;
             catchup += 1;
         }
@@ -552,6 +614,27 @@ fn main() -> Result<()> {
                 }
             } else if let Some(request) = refresh.on_idle(elapsed) {
                 fbink.submit(request)?;
+            }
+        }
+
+        // Agent screenshot: dump the *composited* gray buffer (not raw fb0),
+        // so we see exactly what PocketJS drew even if system UI later resumes.
+        if injector.want_shot {
+            injector.want_shot = false;
+            let path = injector.shot_path().to_path_buf();
+            match inject::write_pgm(
+                &path,
+                geometry.render_w,
+                geometry.render_h,
+                runtime.damage.current(),
+            ) {
+                Ok(()) => log::info!(
+                    "inject: wrote shot {} ({}x{})",
+                    path.display(),
+                    geometry.render_w,
+                    geometry.render_h
+                ),
+                Err(e) => log::error!("inject: shot failed: {e}"),
             }
         }
 

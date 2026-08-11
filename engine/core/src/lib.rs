@@ -694,6 +694,36 @@ impl Ui {
         ok
     }
 
+    /// Insert a host-rasterized glyph into a loaded atlas slot (runtime CJK).
+    /// Returns false if the slot is empty, full, or coverage size mismatches.
+    /// On success layout is dirtied so the next frame remeasures text.
+    pub fn ensure_font_glyph(
+        &mut self,
+        slot: u8,
+        codepoint: u32,
+        advance: u8,
+        xoff: u8,
+        coverage: &[u8],
+    ) -> bool {
+        let ok = self
+            .fonts
+            .insert_runtime_glyph(slot, codepoint, advance, xoff, coverage)
+            .is_some();
+        if ok {
+            self.layout.dirty = true;
+            self.bump_raster_revision();
+        }
+        ok
+    }
+
+    /// True if the codepoint is already in the slot's cmap (no tofu miss).
+    pub fn font_has_glyph(&self, slot: u8, codepoint: u32) -> bool {
+        self.fonts
+            .atlas(slot)
+            .and_then(|a| a.lookup_entry(codepoint))
+            .is_some()
+    }
+
     // ---- animation ---------------------------------------------------------
 
     /// Start a tween/spring on an animatable prop; `from` = current value.

@@ -3,6 +3,12 @@ node_modules/
 target/
 .DS_Store
 
+# Large CJK bake-time fonts (OFL). Fetch with scripts/fetch-cjk-fonts.sh.
+assets/fonts/NotoSansSC-Regular.otf
+assets/fonts/NotoSansSC-Bold.otf
+# keep the license text if present
+# assets/fonts/NotoSansSC-OFL.txt is small and may be committed
+
 # pass-1 transform cache (content-hash keyed; safe to delete any time)
 .cache/
 # per-app build output of tools/build.ts (dist/ is ignored repo-wide too)

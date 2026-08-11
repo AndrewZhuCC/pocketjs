@@ -174,6 +174,50 @@ impl Atlas {
         &self.bitmap[start..start + per_glyph]
     }
 
+    /// Append a runtime-rasterized glyph (e.g. host FreeType/fontdue for CJK).
+    ///
+    /// `coverage` must be exactly `coverage_width * coverage_height` alpha
+    /// bytes (same layout as bake-time cells). Returns the new gid, or the
+    /// existing gid if `codepoint` is already mapped. `None` if the atlas is
+    /// full or the coverage length is wrong.
+    ///
+    /// gid 0 remains the tofu box; new glyphs are appended after the bake-time
+    /// set. Callers must dirty layout after a successful insert.
+    pub fn insert_runtime_glyph(
+        &mut self,
+        codepoint: u32,
+        advance: u8,
+        xoff: u8,
+        coverage: &[u8],
+    ) -> Option<u16> {
+        if let Some(e) = self.lookup_entry(codepoint) {
+            return Some(e.gid);
+        }
+        let per_glyph = self.coverage_height() as usize * self.bytes_per_row();
+        if coverage.len() != per_glyph {
+            return None;
+        }
+        if self.glyph_count == u16::MAX {
+            return None;
+        }
+        let gid = self.glyph_count;
+        // Reject codepoints that would collide with an existing gid mapping of
+        // U+FFFD only — any cp is fine as long as not already present.
+        self.glyph_count = self.glyph_count.checked_add(1)?;
+        self.bitmap.extend_from_slice(coverage);
+        let ent = CmapEntry {
+            codepoint,
+            gid,
+            advance,
+            xoff,
+        };
+        let idx = self
+            .cmap
+            .partition_point(|e| e.codepoint < codepoint);
+        self.cmap.insert(idx, ent);
+        Some(gid)
+    }
+
     /// Average one logical pixel's density×density coverage samples. This is
     /// the reference reduction for logical-resolution software/CPU fallback
     /// renderers; density 1 returns the original byte exactly.
@@ -244,6 +288,24 @@ impl Fonts {
     #[inline]
     pub fn atlas(&self, slot: u8) -> Option<&Atlas> {
         self.slots.get(slot as usize)?.as_ref()
+    }
+
+    #[inline]
+    pub fn atlas_mut(&mut self, slot: u8) -> Option<&mut Atlas> {
+        self.slots.get_mut(slot as usize)?.as_mut()
+    }
+
+    /// See [`Atlas::insert_runtime_glyph`].
+    pub fn insert_runtime_glyph(
+        &mut self,
+        slot: u8,
+        codepoint: u32,
+        advance: u8,
+        xoff: u8,
+        coverage: &[u8],
+    ) -> Option<u16> {
+        self.atlas_mut(slot)?
+            .insert_runtime_glyph(codepoint, advance, xoff, coverage)
     }
 
     /// (gid, advance, xoff) for a codepoint; a miss resolves to gid 0 (tofu,

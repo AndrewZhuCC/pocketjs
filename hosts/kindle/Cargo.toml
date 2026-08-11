@@ -17,6 +17,8 @@ pocket-ui-surface = { path = "../../engine/crates/pocket-ui-surface" }
 
 anyhow = "1"
 env_logger = "0.11"
+# fontdue disabled for now: full NotoSansSC OTF OOMs Kindle after login.
+# Re-add when shipping a subset font (<500KB).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 libc = "0.2"
 log = "0.4"

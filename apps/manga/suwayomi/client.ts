@@ -166,7 +166,7 @@ export type HttpPost = (
   url: string,
   headers: Record<string, string>,
   body: string,
-) => Promise<{ status: number; body: string; setCookie?: string[] }>;
+) => Promise<{ status: number; body: string; setCookie?: string | string[] }>;
 
 /**
  * Minimal client. `httpPost` must be provided by the host bridge once net
@@ -205,6 +205,7 @@ export class SuwayomiClient {
       this.headers(),
       JSON.stringify({ query, variables: variables ?? {} }),
     );
+    if (res.setCookie) this.mergeCookies(res.setCookie);
     if (res.status === 401) {
       throw new Error("Unauthorized");
     }
@@ -222,6 +223,82 @@ export class SuwayomiClient {
     return json.data;
   }
 
+  setCookie(cookie: string | undefined) {
+    this.config.cookie = cookie;
+  }
+
+  get cookie() {
+    return this.config.cookie;
+  }
+
+  /**
+   * Form login against `/login.html` (Suwayomi / Tachidesk style).
+   * Merges any Set-Cookie into `config.cookie` and validates with GraphQL.
+   */
+  async login(user: string, pass: string): Promise<void> {
+    const loginUrl = `${this.baseUrl}/login.html`;
+    // Warm-up GET (may set initial session cookie).
+    try {
+      const warm = await this.httpPost(
+        loginUrl,
+        { Referer: this.baseUrl, ...(this.config.cookie ? { Cookie: this.config.cookie } : {}) },
+        "",
+      );
+      if (warm.setCookie?.length) {
+        this.mergeCookies(warm.setCookie);
+      }
+    } catch {
+      // continue — some setups skip the warm GET
+    }
+
+    const body = `user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+      Referer: loginUrl,
+    };
+    if (this.config.cookie) headers.Cookie = this.config.cookie;
+
+    const res = await this.httpPost(
+      `${loginUrl}?redirect=${encodeURIComponent("/")}`,
+      headers,
+      body,
+    );
+    if (res.setCookie) this.mergeCookies(res.setCookie);
+    if (/Invalid username or password/i.test(res.body)) {
+      throw new Error("用户名或密码错误");
+    }
+    // Still looking at a login form usually means auth failed or cookie lost.
+    if (/name=["']user["']/i.test(res.body) && /name=["']pass["']/i.test(res.body)) {
+      throw new Error("登录未生效（仍返回登录页，检查账号或 Cookie）");
+    }
+    if (!this.config.cookie) {
+      throw new Error("登录未返回 Cookie（host 需跟随重定向收集 Set-Cookie）");
+    }
+    const ok = await this.validateLogin();
+    if (!ok) throw new Error("登录后 GraphQL 校验失败（会话无效）");
+  }
+
+  private mergeCookies(setCookie: string[] | string) {
+    const incoming = Array.isArray(setCookie) ? setCookie : [setCookie];
+    const map = new Map<string, string>();
+    const absorb = (header: string) => {
+      for (const part of header.split(";")) {
+        const nv = part.trim();
+        if (!nv || !nv.includes("=")) continue;
+        // Only keep name=value tokens (skip Path=/ etc. already stripped by host,
+        // but be defensive).
+        if (/^(Path|Domain|Expires|Max-Age|Secure|HttpOnly|SameSite)=/i.test(nv)) continue;
+        const eq = nv.indexOf("=");
+        const name = nv.slice(0, eq).trim();
+        const value = nv.slice(eq + 1).trim();
+        if (name) map.set(name, value);
+      }
+    };
+    if (this.config.cookie) absorb(this.config.cookie);
+    for (const c of incoming) absorb(c);
+    this.config.cookie = [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+
   async validateLogin(): Promise<boolean> {
     try {
       const data = await this.graphql<{ categories: unknown }>(VALIDATE);
@@ -234,10 +311,43 @@ export class SuwayomiClient {
   async listCategories() {
     const data = await this.graphql<{
       categories: {
-        nodes: { id: number; name: string; order: number; mangas?: { totalCount: number } }[];
+        nodes: {
+          id: number;
+          name: string;
+          order: number;
+          default?: boolean;
+          mangas?: { totalCount: number };
+        }[];
       };
     }>(CATEGORIES, { first: 200, offset: 0 });
     return data.categories.nodes ?? [];
+  }
+
+  /** Library mangas without category filter (all in-library). */
+  async listAllLibraryMangas(first = 50, offset = 0) {
+    const data = await this.graphql<{
+      mangas: { nodes: Record<string, unknown>[]; totalCount: number };
+    }>(
+      `query GET_ALL_LIBRARY($first: Int!, $offset: Int!) {
+        mangas(
+          condition: { inLibrary: true }
+          first: $first
+          offset: $offset
+          order: [{ by: TITLE, byType: ASC }]
+        ) {
+          nodes {
+            id title thumbnailUrl inLibrary sourceId unreadCount
+            source { id displayName }
+          }
+          totalCount
+        }
+      }`,
+      { first, offset },
+    );
+    return {
+      totalCount: data.mangas.totalCount,
+      items: (data.mangas.nodes ?? []).map((n) => this.mapManga(n)),
+    };
   }
 
   async listLibraryMangas(categoryId: number, first = 50, offset = 0) {
@@ -312,8 +422,10 @@ export class SuwayomiClient {
         hasNextPage: boolean;
       };
     }>(FETCH_SOURCE_MANGA, {
+      // Suwayomi source ids are Longs serialized as strings — must stay strings
+      // in GraphQL variables (Number would overflow / type-reject as Long).
       input: {
-        source: Number(opts.sourceId),
+        source: String(opts.sourceId),
         type: opts.type,
         page: opts.page,
         query: opts.query ?? null,

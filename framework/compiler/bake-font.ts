@@ -7,10 +7,16 @@
 // out — the core resolves cmap misses to gid 0 (tofu) at runtime.
 //
 // Rasterization: opentype.js outlines, flattened to polylines, scanline
-// even-odd fill with horizontally-biased supersampling into 8-bit coverage
-// cells. Atlas v3 keeps cell/line/cmap metrics in LOGICAL px while baking the
-// bitmap at `rasterDensity` samples per logical px. A Vita density-2 build can
-// therefore draw sharp 2x coverage without changing PSP-compatible layout.
+// **non-zero winding** fill with horizontally-biased supersampling into 8-bit
+// coverage cells. (Even-odd punches wrong holes in many CJK outlines; Latin
+// Inter contours stay correct under non-zero.) Atlas v3 keeps cell/line/cmap
+// metrics in LOGICAL px while baking the bitmap at `rasterDensity` samples per
+// logical px. A Vita density-2 build can therefore draw sharp 2x coverage
+// without changing PSP-compatible layout.
+//
+// Mixed scripts: optional CJK companion fonts (Noto Sans SC). ASCII/Latin stay
+// on Inter so English is not "split" by a CJK-primary face; Han + CJK punct
+// resolve from the companion.
 // Cells are tight in logical space: cellW = max inked logical width over the
 // slot's glyphs; their coverage cells are exactly cellW*density by
 // cellH*density. Proportional advances (font units * px/upm, rounded) live in
@@ -60,8 +66,27 @@ export interface BakeOptions {
   extraChars?: string;
   /** Raster samples per logical pixel. Defaults to 1. */
   rasterDensity?: number;
+  /** Primary face (Inter by default) — Latin / general. */
   regularTtf?: string;
   boldTtf?: string;
+  /**
+   * Optional CJK companion faces (e.g. Noto Sans SC). When set, Han + CJK
+   * punctuation/fullwidth codepoints resolve here; everything else stays on
+   * the primary face so mixed Chinese/English UIs keep Inter Latin metrics.
+   */
+  cjkRegularTtf?: string;
+  cjkBoldTtf?: string;
+}
+
+/** Codepoints that should prefer a CJK companion face when one is configured. */
+export function isCjkCodepoint(cp: number): boolean {
+  return (
+    (cp >= 0x3000 && cp <= 0x303f) || // CJK symbols & punctuation
+    (cp >= 0x3400 && cp <= 0x4dbf) || // CJK ext A
+    (cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xff00 && cp <= 0xffef) // half/fullwidth forms
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -137,10 +162,16 @@ function flatten(path: Path, curveSteps = CURVE_STEPS): Contour[] {
 const SS_X = 9; // horizontal subpixel samples per pixel
 const SS_Y = 3; // vertical samples per pixel
 
+type Crossing = { x: number; dir: number };
+
 /**
  * Rasterize contours into a grayscale coverage cell. Horizontal sampling is
  * intentionally denser than vertical sampling so thin glyph stems can land on
  * subpixel boundaries without collapsing to a hard 1-bit edge.
+ *
+ * Fill rule is **non-zero winding** (not even-odd): CJK outlines from Noto and
+ * similar faces often self-overlap in ways even-odd turns into broken strokes
+ * or wrong holes; correctly oriented Latin contours remain filled the same.
  */
 function rasterize(contours: Contour[], cellW: number, cellH: number): Uint8Array {
   const out = new Uint8Array(cellH * cellW);
@@ -148,32 +179,45 @@ function rasterize(contours: Contour[], cellW: number, cellH: number): Uint8Arra
   const sw = cellW * SS_X;
   const samplesPerPixel = SS_X * SS_Y;
   const counts = new Uint16Array(cellW); // covered subsamples per pixel column, one row at a time
-  const xs: number[] = [];
+  const crossings: Crossing[] = [];
   for (let row = 0; row < cellH; row++) {
     counts.fill(0);
     for (let sub = 0; sub < SS_Y; sub++) {
       const y = row + (sub + 0.5) / SS_Y;
-      xs.length = 0;
+      crossings.length = 0;
       for (const c of contours) {
         for (let i = 0; i < c.length - 1; i++) {
           const p0 = c[i];
           const p1 = c[i + 1];
-          if ((p0.y <= y && p1.y > y) || (p1.y <= y && p0.y > y)) {
-            xs.push(p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y));
+          // Strict inequality on one end avoids double-counting shared vertices.
+          if (p0.y <= y && p1.y > y) {
+            crossings.push({
+              x: p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y),
+              dir: 1,
+            });
+          } else if (p1.y <= y && p0.y > y) {
+            crossings.push({
+              x: p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y),
+              dir: -1,
+            });
           }
         }
       }
-      if (xs.length < 2) continue;
-      xs.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < xs.length; k += 2) {
-        // subcolumn centers inside [xs[k], xs[k+1])
-        let s0 = Math.ceil(xs[k] * SS_X - 0.5);
-        let s1 = Math.floor(xs[k + 1] * SS_X - 0.5);
+      if (crossings.length < 2) continue;
+      crossings.sort((a, b) => a.x - b.x || a.dir - b.dir);
+      let wind = 0;
+      for (let k = 0; k + 1 < crossings.length; k++) {
+        const x0 = crossings[k].x;
+        wind += crossings[k].dir;
+        const x1 = crossings[k + 1].x;
+        if (wind === 0 || x1 <= x0) continue;
+        let s0 = Math.ceil(x0 * SS_X - 0.5);
+        let s1 = Math.floor(x1 * SS_X - 0.5);
         if (s0 < 0) s0 = 0;
         if (s1 >= sw) s1 = sw - 1;
         for (let s = s0; s <= s1; s++) {
           const center = (s + 0.5) / SS_X;
-          if (center >= xs[k] && center < xs[k + 1]) counts[(s / SS_X) | 0]++;
+          if (center >= x0 && center < x1) counts[(s / SS_X) | 0]++;
         }
       }
     }
@@ -243,8 +287,11 @@ export function bakeSlot(
   bold: boolean,
   chars: number[],
   rasterDensity = 1,
+  cjkFont?: Font | null,
 ): BakedAtlas {
   rasterDensity = checkedRasterDensity(rasterDensity);
+  // Line metrics always come from the primary (Latin) face so mixed-script
+  // lines share one baseline/line-height with Inter-era apps.
   const upm = font.unitsPerEm;
   const scale = px / upm;
   const ascent = font.ascender * scale;
@@ -271,15 +318,34 @@ export function bakeSlot(
   for (const cp of chars) {
     if (cp === TOFU_CODEPOINT) continue; // reserved for gid 0
     const ch = String.fromCodePoint(cp);
-    const gi = font.charToGlyphIndex(ch);
+    const preferCjk = !!cjkFont && isCjkCodepoint(cp);
+    const primary = preferCjk ? cjkFont! : font;
+    let gi = primary.charToGlyphIndex(ch);
+    let src = primary;
+    // Fall back across faces so a missing punct in one still bakes.
+    if (gi <= 0 && preferCjk) {
+      gi = font.charToGlyphIndex(ch);
+      src = font;
+    } else if (gi <= 0 && cjkFont) {
+      gi = cjkFont.charToGlyphIndex(ch);
+      src = cjkFont;
+    }
     if (gi <= 0) continue;
-    const glyph = font.glyphs.get(gi);
-    const advance = Math.max(0, Math.min(255, Math.round((glyph.advanceWidth ?? 0) * scale)));
+    const glyph = src.glyphs.get(gi);
+    const srcScale = px / src.unitsPerEm;
+    const advance = Math.max(
+      0,
+      Math.min(255, Math.round((glyph.advanceWidth ?? 0) * srcScale)),
+    );
+    // Same logical baseline + px size for both faces; denser curves for CJK.
     const path = glyph.getPath(0, baseline, px);
+    const curveSteps = preferCjk || src !== font
+      ? CURVE_STEPS * 2
+      : CURVE_STEPS;
     // Keep every metric byte-for-byte equivalent to the density-1 bake. The
     // higher-density contour gets more curve subdivisions, then is scaled into
     // raster space only after logical bounds/xoff have been resolved.
-    const metricContours = flatten(path);
+    const metricContours = flatten(path, curveSteps);
     let minX = 0;
     let maxX = 0;
     for (const c of metricContours) {
@@ -292,7 +358,7 @@ export function bakeSlot(
     maxX += xoff;
     const contours = rasterDensity === 1
       ? metricContours
-      : flatten(path, CURVE_STEPS * rasterDensity);
+      : flatten(path, curveSteps * rasterDensity);
     for (const c of contours) {
       for (const p of c) {
         p.x = (p.x + xoff) * rasterDensity;
@@ -387,8 +453,10 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
     if (cp >= 32 && cp !== 127) cps.add(cp);
   }
   const chars = [...cps].sort((a, b) => a - b);
+  const needsCjk = chars.some(isCjkCodepoint);
 
   const fonts: Record<"regular" | "bold", Font | null> = { regular: null, bold: null };
+  const cjkFonts: Record<"regular" | "bold", Font | null> = { regular: null, bold: null };
   const results: BakedAtlas[] = [];
   for (const slot of [...opts.slots].sort((a, b) => a - b)) {
     if (slot < 0 || slot >= MAX_FONT_SLOTS) {
@@ -396,8 +464,21 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
     }
     const { px, bold } = fontSlotInfo(slot);
     const key = bold ? "bold" : "regular";
-    fonts[key] ??= await loadFont(bold ? (opts.boldTtf ?? DEFAULT_BOLD) : (opts.regularTtf ?? DEFAULT_REGULAR));
-    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity));
+    fonts[key] ??= await loadFont(
+      bold ? (opts.boldTtf ?? DEFAULT_BOLD) : (opts.regularTtf ?? DEFAULT_REGULAR),
+    );
+    let cjk: Font | null = null;
+    if (needsCjk) {
+      const cjkPath = bold
+        ? (opts.cjkBoldTtf ?? opts.cjkRegularTtf)
+        : opts.cjkRegularTtf;
+      if (cjkPath) {
+        const cjkKey = bold && opts.cjkBoldTtf ? "bold" : "regular";
+        cjkFonts[cjkKey] ??= await loadFont(cjkPath);
+        cjk = cjkFonts[cjkKey];
+      }
+    }
+    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, cjk));
   }
   return results;
 }

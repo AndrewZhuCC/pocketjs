@@ -42,7 +42,7 @@ import type { PocketConfig } from "../framework/src/config.ts";
 import { verifyPlanHash, type ResolvedBuildPlan } from "../framework/src/manifest/plan.ts";
 import { registerAnimationTheme } from "../framework/compiler/animation.ts";
 import { compileClasses, generateStylesModule } from "../framework/compiler/tailwind.ts";
-import { bakeAtlases } from "../framework/compiler/bake-font.ts";
+import { bakeAtlases, isCjkCodepoint } from "../framework/compiler/bake-font.ts";
 import { bakeSvg } from "../framework/compiler/bake-svg.ts";
 import {
   assertDensityVariantDimensions,
@@ -294,6 +294,34 @@ console.log(
     `${Object.keys(styles.ids).length} literal(s) -> framework/src/styles.generated.ts`,
 );
 
+// Inter (default) has no CJK. When the app harvests Han ideographs from
+// *source literals*, attach Noto Sans SC as a companion face so static UI
+// Chinese is not tofu.
+//
+// Dynamic API text (manga titles) is NOT harvested here — Kindle host injects
+// those at runtime via fontdue (manga.ensureChars). Do NOT bake cjk-common.txt
+// into the pak: ~2k glyphs @4x blew the package to ~47MB and OOM-killed the
+// device (launcher status 137).
+let cjkRegularPath: string | undefined;
+let cjkBoldPath: string | undefined;
+const needsCjk = [...codepoints].some(isCjkCodepoint);
+if (needsCjk) {
+  const cjkRegular = join(ROOT, "assets/fonts/NotoSansSC-Regular.otf");
+  const cjkBold = join(ROOT, "assets/fonts/NotoSansSC-Bold.otf");
+  if (existsSync(cjkRegular)) {
+    cjkRegularPath = cjkRegular;
+    cjkBoldPath = existsSync(cjkBold) ? cjkBold : cjkRegular;
+    console.log(
+      "  font: CJK literals — Inter + Noto companion (dynamic titles → host runtime_font)",
+    );
+  } else {
+    console.warn(
+      "  font: CJK literals present but NotoSansSC-Regular.otf missing; " +
+        "run scripts/fetch-cjk-fonts.sh",
+    );
+  }
+}
+
 const atlases = await bakeAtlases({
   codepoints,
   slots: styles.usedFontSlots,
@@ -301,6 +329,8 @@ const atlases = await bakeAtlases({
   rasterDensity,
   regularTtf: regularFontPath,
   boldTtf: boldFontPath,
+  cjkRegularTtf: cjkRegularPath,
+  cjkBoldTtf: cjkBoldPath,
 });
 for (const a of atlases) {
   console.log(
